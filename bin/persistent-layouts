@@ -684,6 +684,19 @@ def cmd_save(args: argparse.Namespace) -> int:
     if snap["id"] in existing and name is None:
         snap["name"] = existing[snap["id"]].get("name") or snap["name"]
     path = write_profile(snap)
+    # Keep HyprMon's generated file in step with what was just saved, so the
+    # two cannot drift apart until the next apply.
+    write_hyprmon(
+        [
+            {
+                "name": o["output_hint"],
+                "mode": o["mode"],
+                "position": o["position"],
+                "scale": o["scale"],
+            }
+            for o in snap["outputs"]
+        ]
+    )
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     mons = hypr_monitors()
     ACTIVE_PATH.write_text(snap["id"] + "\n")
