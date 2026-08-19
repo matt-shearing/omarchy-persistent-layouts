@@ -6,7 +6,7 @@ Save a Hyprland desk. Get it back when the same screens plug in.
 
 Persistent Layouts is an [Omarchy](https://omarchy.org) bar widget for people who move between setups: laptop only, a dock at home, a TV on the road. It remembers each named layout and restores the matching one automatically.
 
-Screens are matched by **make and model**, not `DP-3` / `HDMI-A-1`. Connector names renumber; the panel does not.
+Screens are matched by **the set that is plugged in**, not by `DP-3` / `HDMI-A-1`. Connector names renumber; the set of panels on your desk does not. A two-screen layout will not win while three screens are connected, and a spare panel is never quietly conscripted to stand in for a saved one.
 
 It is a profile switcher, not a spatial editor. Arrange the screens with HyprMon or `hyprctl`, then save. The widget applies what you saved.
 
@@ -24,6 +24,27 @@ Other listed tools cover adjacent jobs:
 
 Persistent Layouts only switches named profiles. Geometry stays with whatever you already use to place monitors.
 
+## When two panels claim the same identity
+
+Some displays lie. Cheap portables sit behind a generic scaler chip that reports
+a placeholder EDID — a stock vendor string and a serial like `0x01010101` — so
+two physically different panels can be indistinguishable, and the mode list one
+of them advertises may not be a mode it can actually show. Driving such a panel
+at its "preferred" resolution can leave it dark with the backlight off.
+
+Persistent Layouts handles that by never trusting a single display's identity on
+its own:
+
+- The **connected set** picks the layout, so the same panel can mean different
+  things in different desks.
+- The saved mode is applied verbatim. A profile records what actually worked on
+  that panel, not what its EDID claims it can do.
+- Panels with a placeholder serial are flagged **unverified EDID** in the widget,
+  and every display row carries its own resolution so two panels reporting the
+  same make and model are still tellable apart.
+- If more than one saved layout fits the connected set, clicking one **pins** it
+  for that set. Auto-apply will not overrule it on the next hotplug.
+
 ## Install
 
 ```sh
@@ -37,7 +58,9 @@ That clones the plugin and can place the widget on the right side of the bar, ne
 - **Click** the chip — open the profile list
 - **Right-click** — apply the profile that matches the connected screens
 - **Save current layout** — snapshot mode, scale, and position for this set of panels
-- **Apply matching layout on plug-in** — restore that snapshot when the same make/model set returns
+- **Apply matching layout on plug-in** — restore that snapshot when the same set of screens returns
+
+Applying a layout is remembered for that set of screens, so an explicit click always beats auto-detection. If an output does not end up where the profile asked, the widget says the apply failed instead of claiming success.
 
 The matching service retries after a display is added or removed, because some HDMI sinks take a few seconds to become ready.
 

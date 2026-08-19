@@ -2,10 +2,10 @@
   "schemaVersion": 1,
   "id": "contra.layouts",
   "name": "Persistent Layouts",
-  "version": "1.0.2",
+  "version": "1.1.0",
   "author": "contra",
   "license": "MIT",
-  "description": "Save named Hyprland desks and restore them when the same screens plug in. Matches displays by make and model, not connector names.",
+  "description": "Save named Hyprland desks and restore them when the same set of screens plugs in. Matches on the whole connected set, never on connector names.",
   "kinds": [
     "service",
     "bar-widget"

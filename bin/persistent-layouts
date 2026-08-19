@@ -1,5 +1,13 @@
 #!/usr/bin/env python3
-"""Save, apply, and autodetect Hyprland display layouts."""
+"""Save, apply, and autodetect Hyprland display layouts.
+
+A profile is chosen by the *set* of connected displays, not by any single
+display's identity. That matters because two physically different panels can
+report the same EDID: a cheap portable behind a generic scaler chip can be
+indistinguishable from the TV whose EDID it apes. Identity alone cannot tell
+those apart, so the connected set decides, and an explicit click always wins
+and is remembered for that set.
+"""
 from __future__ import annotations
 
 import argparse
@@ -9,6 +17,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -21,6 +30,8 @@ STATE_DIR = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state"))
 LEGACY_STATE_DIR = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "omarchy"
 ACTIVE_PATH = STATE_DIR / "active"
 LAST_SET_PATH = STATE_DIR / "last-set"
+CHOICE_PATH = STATE_DIR / "choices.json"
+ERROR_PATH = STATE_DIR / "last-error"
 LEGACY_ACTIVE_PATH = LEGACY_STATE_DIR / "display-profile-active"
 LEGACY_LAST_SET_PATH = LEGACY_STATE_DIR / "display-profile-last-set"
 
@@ -29,6 +40,9 @@ HYPRMON = Path.home() / ".config/hypr/hyprmon.lua"
 OUTPUT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$")
 MODE_RE = re.compile(r"^(preferred|\d{3,5}x\d{3,5}@\d{1,4}(?:\.\d{1,3})?)$")
 POS_RE = re.compile(r"^(auto|-?\d{1,6}x-?\d{1,6})$")
+
+# How long to let Hyprland settle before reading back what actually applied.
+SETTLE_SECONDS = 0.6
 
 
 def run_json(cmd: list[str]) -> object:
@@ -40,7 +54,13 @@ def hypr_monitors() -> list[dict]:
     return list(run_json(["hyprctl", "-j", "monitors"]))
 
 
+# --------------------------------------------------------------------------
+# Identity
+# --------------------------------------------------------------------------
+
 def fingerprint(mon: dict) -> str:
+    """Stable identity for a live monitor. Deliberately excludes the connector
+    name, which renumbers, and the serial, which some panels fake."""
     make = str(mon.get("make") or "").strip()
     model = str(mon.get("model") or "").strip()
     if make and model:
@@ -62,8 +82,17 @@ def match_fingerprint(match: dict) -> str:
     return str(match.get("output_hint") or "").strip()
 
 
+def mon_serial(mon: dict) -> str:
+    return str(mon.get("serial") or "").strip()
+
+
 def connected_set(mons: list[dict]) -> frozenset[str]:
     return frozenset(fingerprint(m) for m in mons if fingerprint(m))
+
+
+def topology_id(mons: list[dict]) -> str:
+    """Key for 'which displays are plugged in', independent of their modes."""
+    return "\n".join(sorted(fingerprint(m) for m in mons if fingerprint(m)))
 
 
 def mode_string(mon: dict) -> str:
@@ -78,6 +107,43 @@ def slugify(name: str) -> str:
     s = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
     return s or "layout"
 
+
+def mode_dims_from_string(mode: str) -> str:
+    m = re.match(r"(\d+)x(\d+)", str(mode or ""))
+    return f"{m.group(1)}x{m.group(2)}" if m else ""
+
+
+def mode_dims(mon: dict) -> str:
+    try:
+        return f"{int(mon['width'])}x{int(mon['height'])}"
+    except (KeyError, TypeError, ValueError):
+        return mode_dims_from_string(mode_string(mon))
+
+
+def spec_dims(spec: dict) -> str:
+    return mode_dims_from_string(str(spec.get("mode") or ""))
+
+
+def placeholder_serial(serial: str) -> bool:
+    """Generic scaler chips ship placeholder serials like 0x01010101."""
+    s = serial.lower().removeprefix("0x")
+    return bool(s) and len(set(s)) <= 2 and s in {"0" * len(s), "01" * (len(s) // 2)}
+
+
+def auto_label(mon: dict) -> str:
+    """Human-facing name. Always carries the resolution, so two panels that
+    report the same make/model are still tellable apart in the UI."""
+    name = str(mon.get("model") or "").strip() or str(mon.get("description") or "").strip()
+    name = name or str(mon.get("name") or "display")
+    label = f"{name} · {mode_dims(mon)}"
+    if placeholder_serial(mon_serial(mon)):
+        label += " · unverified EDID"
+    return label
+
+
+# --------------------------------------------------------------------------
+# Storage
+# --------------------------------------------------------------------------
 
 def ensure_layout_dirs() -> None:
     PROFILE_DIR.mkdir(parents=True, exist_ok=True)
@@ -143,6 +209,16 @@ def profile_set(profile: dict) -> frozenset[str]:
     )
 
 
+def profile_topology_id(profile: dict) -> str:
+    return "\n".join(
+        sorted(
+            match_fingerprint(o.get("match") or {})
+            for o in profile.get("outputs") or []
+            if match_fingerprint(o.get("match") or {})
+        )
+    )
+
+
 def write_profile(profile: dict) -> Path:
     ensure_layout_dirs()
     pid = profile["id"]
@@ -152,52 +228,60 @@ def write_profile(profile: dict) -> Path:
     return path
 
 
-def snapshot(name: str | None = None, pid: str | None = None) -> dict:
-    mons = hypr_monitors()
-    if not mons:
-        raise SystemExit("no monitors from hyprctl")
-    if not pid:
-        pid = slugify(name or f"{len(mons)}-screen")
-    if not name:
-        name = pid.replace("-", " ").title()
-    outputs = []
-    for mon in mons:
-        outputs.append(
-            {
-                "match": {
-                    "make": str(mon.get("make") or ""),
-                    "model": str(mon.get("model") or ""),
-                    "description": str(mon.get("description") or ""),
-                },
-                "output_hint": mon["name"],
-                "mode": mode_string(mon),
-                "scale": float(mon.get("scale") or 1),
-                "position": f'{int(mon["x"])}x{int(mon["y"])}',
-            }
-        )
-    return {
-        "id": pid,
-        "name": name,
-        "updated": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "outputs": outputs,
-    }
-
-
-def mode_dims_from_string(mode: str) -> str:
-    m = re.match(r"(\d+)x(\d+)", str(mode or ""))
-    return f"{m.group(1)}x{m.group(2)}" if m else ""
-
-
-def mode_dims(mon: dict) -> str:
+def active_id() -> str:
     try:
-        return f"{int(mon['width'])}x{int(mon['height'])}"
-    except (KeyError, TypeError, ValueError):
-        return mode_dims_from_string(mode_string(mon))
+        return ACTIVE_PATH.read_text().strip()
+    except OSError:
+        return ""
 
 
-def spec_dims(spec: dict) -> str:
-    return mode_dims_from_string(str(spec.get("mode") or ""))
+def last_set() -> list[str]:
+    try:
+        data = json.loads(LAST_SET_PATH.read_text())
+        return [str(x) for x in data] if isinstance(data, list) else []
+    except (OSError, json.JSONDecodeError):
+        return []
 
+
+def load_choices() -> dict:
+    try:
+        data = json.loads(CHOICE_PATH.read_text())
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def remember_choice(mons: list[dict], pid: str) -> None:
+    """An explicit apply pins that profile to this set of displays, so
+    auto-apply cannot second-guess the user on the next hotplug."""
+    ensure_layout_dirs()
+    choices = load_choices()
+    choices[topology_id(mons)] = pid
+    CHOICE_PATH.write_text(json.dumps(choices, indent=2) + "\n")
+
+
+def recall_choice(mons: list[dict]) -> str:
+    return str(load_choices().get(topology_id(mons)) or "")
+
+
+def set_error(message: str) -> None:
+    ensure_layout_dirs()
+    if message:
+        ERROR_PATH.write_text(message.strip() + "\n")
+    elif ERROR_PATH.exists():
+        ERROR_PATH.unlink()
+
+
+def last_error() -> str:
+    try:
+        return ERROR_PATH.read_text().strip()
+    except OSError:
+        return ""
+
+
+# --------------------------------------------------------------------------
+# Matching
+# --------------------------------------------------------------------------
 
 def topology_key(mons: list[dict]) -> list[str]:
     return sorted(f"{fingerprint(m)}|{mode_dims(m)}" for m in mons)
@@ -210,44 +294,49 @@ def assignment_score(spec: dict, mon: dict) -> int:
     got_fp = fingerprint(mon)
     if want_fp and got_fp == want_fp:
         score += 100
+    want_serial = str(match.get("serial") or "").strip()
+    if want_serial and want_serial == mon_serial(mon):
+        score += 30
     want_desc = str(match.get("description") or "").strip()
     got_desc = str(mon.get("description") or "")
     if want_desc and want_desc == got_desc:
-        score += 50
-    elif want_desc and want_desc in got_desc:
-        score += 30
-    want_model = str(match.get("model") or "").strip()
-    if want_model and want_model in got_desc:
         score += 20
     want_dims = spec_dims(spec)
     if want_dims and want_dims == mode_dims(mon):
         score += 40
-    want_mode = str(spec.get("mode") or "")
-    if want_mode and want_mode == mode_string(mon):
-        score += 15
+    if str(spec.get("mode") or "") == mode_string(mon):
+        score += 10
     hint = str(spec.get("output_hint") or "")
     if hint and mon.get("name") == hint:
-        score += 8
+        score += 5
     return score
 
 
-def assign_outputs(
-    profile: dict, mons: list[dict], require_all_monitors: bool = True
-) -> list[tuple[dict, dict]] | None:
-    """Map each profile output to a unique live monitor.
+def profile_matches_topology(profile: dict, mons: list[dict]) -> bool:
+    """Exact match on the multiset of connected identities.
 
-    Same make|model on two panels (cloned EDID) is disambiguated by
-    resolution. A leftover panel can fill a missing identity so a 3-screen
-    desk still matches when one EDID is wrong. Detect requires a 1:1
-    mapping; apply only requires every saved output to be placed.
+    Exact, not fuzzy: a 2-display profile must never win while 3 displays are
+    plugged in, and a leftover display must never be quietly conscripted to
+    fill a saved output it is not.
+    """
+    want = sorted(
+        match_fingerprint(o.get("match") or {}) for o in profile.get("outputs") or []
+    )
+    got = sorted(fingerprint(m) for m in mons)
+    return bool(want) and want == got
+
+
+def assign_outputs(profile: dict, mons: list[dict]) -> list[tuple[dict, dict]] | None:
+    """Map each saved output to exactly one live monitor.
+
+    Only called once the topology already matches, so this is purely about
+    which spec goes with which monitor when several share a fingerprint.
     """
     specs = list(profile.get("outputs") or [])
-    if not specs or not mons:
-        return None
-    if require_all_monitors and len(specs) != len(mons):
+    if not specs or not mons or len(specs) != len(mons):
         return None
 
-    pairs: list[tuple[int, int, int]] = []
+    pairs = []
     for si, spec in enumerate(specs):
         for mi, mon in enumerate(mons):
             pairs.append((-assignment_score(spec, mon), si, mi))
@@ -259,42 +348,86 @@ def assign_outputs(
     for _neg, si, mi in pairs:
         if si in used_s or mi in used_m:
             continue
-        if assignment_score(specs[si], mons[mi]) <= 0:
-            continue
         used_s.add(si)
         used_m.add(mi)
         mapping[si] = mons[mi]
-
-    leftover_s = [i for i in range(len(specs)) if i not in used_s]
-    leftover_m = [i for i in range(len(mons)) if i not in used_m]
-    if leftover_s:
-        if require_all_monitors and len(leftover_s) != len(leftover_m):
-            return None
-        rem = []
-        for si in leftover_s:
-            for mi in leftover_m:
-                rem.append((-assignment_score(specs[si], mons[mi]), si, mi))
-        rem.sort()
-        for _neg, si, mi in rem:
-            if si in used_s or mi in used_m:
-                continue
-            used_s.add(si)
-            used_m.add(mi)
-            mapping[si] = mons[mi]
-        if len(mapping) != len(specs):
-            return None
-
-    if require_all_monitors and len(mapping) != len(mons):
+    if len(mapping) != len(specs):
         return None
     return [(specs[i], mapping[i]) for i in range(len(specs))]
 
 
-def find_output(mons: list[dict], spec: dict) -> dict | None:
-    mapping = assign_outputs({"outputs": [spec]}, mons, require_all_monitors=False)
-    if not mapping:
-        return None
-    return mapping[0][1]
+def scale_eq(a: object, b: object) -> bool:
+    try:
+        return abs(float(a) - float(b)) < 0.02
+    except (TypeError, ValueError):
+        return False
 
+
+def spec_satisfied(spec: dict, mon: dict) -> bool:
+    want_dims = spec_dims(spec)
+    if want_dims and want_dims != mode_dims(mon):
+        return False
+    if not scale_eq(spec.get("scale", 1), mon.get("scale", 1)):
+        return False
+    want_pos = str(spec.get("position") or "auto")
+    if want_pos != "auto":
+        if want_pos != f'{int(mon["x"])}x{int(mon["y"])}':
+            return False
+    return True
+
+
+def profile_is_applied(profile: dict, mons: list[dict]) -> bool:
+    """True when the live layout already equals the profile.
+
+    Compared against real monitor state rather than a remembered token, so a
+    stale state file can never cause an apply loop.
+    """
+    mapping = assign_outputs(profile, mons)
+    if not mapping:
+        return False
+    return all(spec_satisfied(spec, mon) for spec, mon in mapping)
+
+
+def detect(profiles: list[dict], mons: list[dict]) -> dict | None:
+    if not mons:
+        return None
+    candidates = [
+        p for p in profiles
+        if profile_matches_topology(p, mons) and assign_outputs(p, mons) is not None
+    ]
+    if not candidates:
+        return None
+    if len(candidates) == 1:
+        return candidates[0]
+
+    # Several profiles describe this exact set of displays. Prefer what the
+    # user last chose for this set, then whatever is already applied, then the
+    # active one. Only then fall back to an arbitrary but stable order.
+    chosen = recall_choice(mons)
+    for p in candidates:
+        if p.get("id") == chosen:
+            return p
+    for p in candidates:
+        if profile_is_applied(p, mons):
+            return p
+    current = active_id()
+    for p in candidates:
+        if p.get("id") == current:
+            return p
+    return sorted(candidates, key=lambda p: str(p.get("id") or ""))[0]
+
+
+def detect_ambiguous(profiles: list[dict], mons: list[dict]) -> list[str]:
+    return [
+        str(p.get("id") or "")
+        for p in profiles
+        if profile_matches_topology(p, mons) and assign_outputs(p, mons) is not None
+    ]
+
+
+# --------------------------------------------------------------------------
+# Apply
+# --------------------------------------------------------------------------
 
 def check_output_name(name: str) -> str:
     if not OUTPUT_RE.fullmatch(name):
@@ -328,11 +461,6 @@ def lua_string(value: str) -> str:
     return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
-def is_cloned_lg(mon: dict) -> bool:
-    blob = " ".join(str(mon.get(k) or "") for k in ("description", "make", "model")).lower()
-    return "sscr2" in blob or "lg tv" in blob
-
-
 def apply_monitor(name: str, mode: str, pos: str, scale: float) -> None:
     expr = (
         "hl.monitor({ output = %s, mode = %s, position = %s, scale = %.2f })"
@@ -341,34 +469,53 @@ def apply_monitor(name: str, mode: str, pos: str, scale: float) -> None:
     subprocess.check_call(["hyprctl", "eval", expr], stdout=subprocess.DEVNULL)
 
 
-def retrain_output(name: str) -> None:
-    """Arzopa-class HDMI portables clone a 4K LG EDID and stay dark until the link is bounced."""
-    subprocess.check_call(
-        ["hyprctl", "eval", "hl.monitor({ output = %s, disabled = true })" % lua_string(name)],
-        stdout=subprocess.DEVNULL,
-    )
-    subprocess.run(["sleep", "0.4"], check=False)
+def apply_profile(profile: dict) -> list[str]:
+    """Apply a profile and report, per output, anything that did not take.
 
-
-def apply_profile(profile: dict) -> None:
+    Returns a list of human-readable problems; empty means everything landed.
+    Hyprland accepting a modeset does not prove the panel lit up, so this only
+    claims what it can actually verify: that the compositor is now driving the
+    geometry the profile asked for.
+    """
     mons = hypr_monitors()
-    mapping = assign_outputs(profile, mons, require_all_monitors=False)
+    mapping = assign_outputs(profile, mons)
     if not mapping:
         raise SystemExit("could not match saved outputs to the connected screens")
+
     applied = []
     for spec, mon in mapping:
         name = check_output_name(str(mon["name"]))
         mode = check_mode(str(spec.get("mode") or "preferred"))
         pos = check_position(str(spec.get("position") or "auto"))
         scale = check_scale(spec.get("scale", 1))
-        if is_cloned_lg(mon) and spec_dims(spec) == "1920x1080":
-            retrain_output(name)
         apply_monitor(name, mode, pos, scale)
-        applied.append({"name": name, "mode": mode, "position": pos, "scale": scale})
-    write_hyprmon(applied)
+        applied.append(
+            {"name": name, "mode": mode, "position": pos, "scale": scale, "spec": spec}
+        )
+
+    time.sleep(SETTLE_SECONDS)
+    after = {m["name"]: m for m in hypr_monitors()}
+
+    problems = []
+    for item in applied:
+        mon = after.get(item["name"])
+        label = str(item["spec"].get("label") or "") or item["name"]
+        if mon is None:
+            problems.append(f"{label}: output disappeared after apply")
+            continue
+        if not spec_satisfied(item["spec"], mon):
+            problems.append(
+                f"{label}: asked for {item['mode']} @{item['scale']:g} {item['position']}, "
+                f"got {mode_string(mon)} @{float(mon.get('scale') or 1):g} {int(mon['x'])}x{int(mon['y'])}"
+            )
+
+    write_hyprmon([{k: v for k, v in i.items() if k != "spec"} for i in applied])
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     ACTIVE_PATH.write_text(profile["id"] + "\n")
-    LAST_SET_PATH.write_text(json.dumps(topology_key(mons)) + "\n")
+    # Written from post-apply state, so "already applied" checks stay truthful.
+    LAST_SET_PATH.write_text(json.dumps(topology_key(list(after.values()))) + "\n")
+    set_error("; ".join(problems))
+    return problems
 
 
 def write_hyprmon(applied: list[dict]) -> None:
@@ -394,42 +541,83 @@ def write_hyprmon(applied: list[dict]) -> None:
     HYPRMON.write_text("\n".join(lines) + "\n")
 
 
-def detect(profiles: list[dict], mons: list[dict]) -> dict | None:
+# --------------------------------------------------------------------------
+# Snapshot
+# --------------------------------------------------------------------------
+
+def snapshot(name: str | None = None, pid: str | None = None) -> dict:
+    mons = hypr_monitors()
     if not mons:
-        return None
-    scored: list[tuple[int, int, str, dict]] = []
-    for profile in profiles:
-        mapping = assign_outputs(profile, mons, require_all_monitors=True)
-        if not mapping:
-            continue
-        total = sum(assignment_score(spec, mon) for spec, mon in mapping)
-        scored.append((total, len(profile.get("outputs") or []), str(profile.get("id") or ""), profile))
-    if not scored:
-        return None
-    scored.sort(reverse=True)
-    return scored[0][3]
+        raise SystemExit("no monitors from hyprctl")
+    if not pid:
+        pid = slugify(name or f"{len(mons)}-screen")
+    if not name:
+        name = pid.replace("-", " ").title()
 
-
-def active_id() -> str:
+    # Carry forward any labels the user already curated for this profile.
+    prior = {}
+    prior_path = PROFILE_DIR / f"{pid}.json"
     try:
-        return ACTIVE_PATH.read_text().strip()
-    except OSError:
-        return ""
-
-
-def last_set() -> list[str]:
-    try:
-        data = json.loads(LAST_SET_PATH.read_text())
-        return [str(x) for x in data] if isinstance(data, list) else []
+        old = json.loads(prior_path.read_text())
+        for o in old.get("outputs") or []:
+            key = (match_fingerprint(o.get("match") or {}), spec_dims(o))
+            if o.get("label"):
+                prior[key] = o["label"]
+            prior.setdefault((key[0], None), o.get("label"))
     except (OSError, json.JSONDecodeError):
-        return []
+        pass
 
+    outputs = []
+    for mon in mons:
+        fp = fingerprint(mon)
+        label = prior.get((fp, mode_dims(mon))) or prior.get((fp, None)) or auto_label(mon)
+        entry = {
+            "match": {
+                "make": str(mon.get("make") or ""),
+                "model": str(mon.get("model") or ""),
+                "serial": mon_serial(mon),
+                "description": str(mon.get("description") or ""),
+            },
+            "output_hint": mon["name"],
+            "mode": mode_string(mon),
+            "scale": float(mon.get("scale") or 1),
+            "position": f'{int(mon["x"])}x{int(mon["y"])}',
+            "label": label,
+        }
+        if placeholder_serial(mon_serial(mon)):
+            # This panel's advertised mode list cannot be trusted; the saved
+            # mode is the only thing known to actually work on it.
+            entry["trust_edid_modes"] = False
+        outputs.append(entry)
+
+    return {
+        "id": pid,
+        "name": name,
+        "updated": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "outputs": outputs,
+    }
+
+
+# --------------------------------------------------------------------------
+# Status
+# --------------------------------------------------------------------------
 
 def status_payload() -> dict:
     mons = hypr_monitors()
     profiles = load_profiles()
     connected = sorted(fingerprint(m) for m in mons)
     match = detect(profiles, mons)
+
+    # Prefer labels from whichever profile describes this set of displays.
+    labels: dict[str, str] = {}
+    source = match or next((p for p in profiles if p.get("id") == active_id()), None)
+    if source:
+        mapping = assign_outputs(source, mons)
+        if mapping:
+            for spec, mon in mapping:
+                if spec.get("label"):
+                    labels[str(mon["name"])] = str(spec["label"])
+
     current = []
     for mon in mons:
         current.append(
@@ -437,47 +625,56 @@ def status_payload() -> dict:
                 "name": mon.get("name"),
                 "fingerprint": fingerprint(mon),
                 "description": mon.get("description"),
+                "label": labels.get(str(mon.get("name"))) or auto_label(mon),
                 "mode": mode_string(mon),
+                "resolution": mode_dims(mon),
                 "scale": mon.get("scale"),
                 "position": f'{int(mon["x"])}x{int(mon["y"])}',
+                "suspect_edid": placeholder_serial(mon_serial(mon)),
             }
         )
+
     listed = []
     for p in profiles:
-        pset = sorted(profile_set(p))
+        matches = profile_matches_topology(p, mons) and assign_outputs(p, mons) is not None
         listed.append(
             {
                 "id": p.get("id"),
                 "name": p.get("name") or p.get("id"),
                 "outputs": len(p.get("outputs") or []),
-                "fingerprints": pset,
-                "matches": assign_outputs(p, mons, require_all_monitors=True) is not None,
+                "fingerprints": sorted(profile_set(p)),
+                "labels": [str(o.get("label") or "") for o in p.get("outputs") or []],
+                "matches": matches,
+                "applied": profile_is_applied(p, mons),
                 "active": p.get("id") == active_id(),
             }
         )
+
     return {
         "ok": True,
         "connected": connected,
         "current": current,
         "active": active_id(),
         "detected": (match or {}).get("id"),
+        "candidates": detect_ambiguous(profiles, mons),
         "profiles": listed,
         "auto": auto_enabled(),
+        "error": last_error(),
     }
 
+
+# --------------------------------------------------------------------------
+# Commands
+# --------------------------------------------------------------------------
 
 def cmd_save(args: argparse.Namespace) -> int:
     existing = {p["id"]: p for p in load_profiles()}
     name = args.name
     pid = args.id
     if not pid and args.update_matching:
-        snap = snapshot(name)
+        mons = hypr_monitors()
         match = next(
-            (
-                p
-                for p in existing.values()
-                if assign_outputs(p, hypr_monitors(), require_all_monitors=True) is not None
-            ),
+            (p for p in existing.values() if profile_matches_topology(p, mons)),
             None,
         )
         if match:
@@ -488,8 +685,10 @@ def cmd_save(args: argparse.Namespace) -> int:
         snap["name"] = existing[snap["id"]].get("name") or snap["name"]
     path = write_profile(snap)
     STATE_DIR.mkdir(parents=True, exist_ok=True)
+    mons = hypr_monitors()
     ACTIVE_PATH.write_text(snap["id"] + "\n")
-    LAST_SET_PATH.write_text(json.dumps(topology_key(hypr_monitors())) + "\n")
+    LAST_SET_PATH.write_text(json.dumps(topology_key(mons)) + "\n")
+    remember_choice(mons, snap["id"])
     if args.json:
         print(json.dumps({"ok": True, "id": snap["id"], "path": str(path)}, indent=2))
     else:
@@ -501,12 +700,20 @@ def cmd_apply(args: argparse.Namespace) -> int:
     profiles = {p["id"]: p for p in load_profiles()}
     if args.name not in profiles:
         raise SystemExit(f"unknown profile: {args.name}")
-    apply_profile(profiles[args.name])
+    mons = hypr_monitors()
+    problems = apply_profile(profiles[args.name])
+    # An explicit apply is the user's decision; pin it so the next hotplug or
+    # auto-apply pass does not overrule it.
+    remember_choice(mons, args.name)
     if args.json:
-        print(json.dumps({"ok": True, "id": args.name}))
+        print(json.dumps({"ok": not problems, "id": args.name, "problems": problems}))
+    elif problems:
+        print(f"applied {args.name} with problems:", file=sys.stderr)
+        for p in problems:
+            print(f"  {p}", file=sys.stderr)
     else:
         print(f"applied {args.name}")
-    return 0
+    return 1 if problems else 0
 
 
 def cmd_list(args: argparse.Namespace) -> int:
@@ -534,16 +741,16 @@ def cmd_detect(args: argparse.Namespace) -> int:
             if args.json:
                 print(json.dumps({"ok": False, "applied": False, "reason": "no-match", "connected": connected}))
             return 1
-        if match["id"] == active_id() and last_set() == topology_key(mons):
+        if profile_is_applied(match, mons):
             if args.json:
                 print(json.dumps({"ok": True, "applied": False, "id": match["id"], "reason": "already"}))
             return 0
-        apply_profile(match)
+        problems = apply_profile(match)
         if args.json:
-            print(json.dumps({"ok": True, "applied": True, "id": match["id"]}))
+            print(json.dumps({"ok": not problems, "applied": True, "id": match["id"], "problems": problems}))
         else:
             print(f"detected {match['id']}")
-        return 0
+        return 1 if problems else 0
     if args.json:
         print(json.dumps({"ok": True, "id": (match or {}).get("id"), "connected": connected}))
         return 0 if match else 1
@@ -577,7 +784,7 @@ def cmd_auto(args: argparse.Namespace) -> int:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description="Save, apply, and autodetect Hyprland display layouts.")
     parser.add_argument("--json", action="store_true")
     sub = parser.add_subparsers(dest="cmd", required=True)
 

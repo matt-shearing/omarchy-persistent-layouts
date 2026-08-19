@@ -93,6 +93,7 @@ Panel {
     bar: root.bar
     text: "󰡃"
     tooltipText: {
+      if (root.status.error) return "Persistent Layouts · apply failed"
       var name = ""
       for (var i = 0; i < root.status.profiles.length; i++) {
         if (root.status.profiles[i].active) { name = root.status.profiles[i].name; break }
@@ -138,24 +139,55 @@ Panel {
         anchors.top: parent.top
         spacing: Style.space(12)
 
+        Text {
+          text: "Persistent Layouts"
+          color: root.bar.foreground
+          font.family: root.bar.fontFamily
+          font.pixelSize: Style.font.title
+          font.bold: true
+        }
+
+        PanelSeparator { foreground: root.bar.foreground }
+
+        // Connected displays, one line each. Two panels can report the same
+        // make and model, so each row carries its own resolution and output.
         Column {
           width: parent.width
-          spacing: Style.space(2)
+          spacing: Style.space(6)
+
           Text {
-            text: "Persistent Layouts"
-            color: root.bar.foreground
-            font.family: root.bar.fontFamily
-            font.pixelSize: Style.font.title
-            font.bold: true
-          }
-          Text {
-            width: parent.width
-            text: Model.connectedLabel(root.status)
+            visible: root.status.current.length === 0
+            text: "No displays"
             color: root.bar.foreground
             opacity: 0.65
             font.family: root.bar.fontFamily
             font.pixelSize: Style.font.bodySmall
-            elide: Text.ElideRight
+          }
+
+          Repeater {
+            model: root.status.current
+            Column {
+              required property var modelData
+              width: parent.width
+              spacing: 0
+              Text {
+                width: parent.width
+                text: Model.displayLabel(modelData)
+                color: root.bar.foreground
+                font.family: root.bar.fontFamily
+                font.pixelSize: Style.font.bodySmall
+                elide: Text.ElideRight
+              }
+              Text {
+                width: parent.width
+                text: Model.displayDetail(modelData)
+                color: root.bar.foreground
+                opacity: 0.55
+                font.family: root.bar.fontFamily
+                font.pixelSize: Style.font.bodySmall
+                elide: Text.ElideRight
+              }
+            }
           }
         }
 
@@ -189,11 +221,32 @@ Panel {
               horizontalPadding: Style.spacing.controlPaddingX
               verticalPadding: Style.spacing.controlPaddingY + Style.space(2)
               bordered: true
-              active: modelData.active === true || modelData.matches === true
+              active: modelData.applied === true || modelData.matches === true
               hasCursor: root.cursorActive && root.focusIndex === index
               onClicked: root.applyProfile(modelData.id)
               onHovered: function(h) { if (h) { root.cursorActive = true; root.focusIndex = index } }
             }
+          }
+
+          Text {
+            visible: Model.isAmbiguous(root.status)
+            width: parent.width
+            text: "More than one layout fits these displays. Click the one you want — it stays picked for this set."
+            color: root.bar.foreground
+            opacity: 0.65
+            wrapMode: Text.WordWrap
+            font.family: root.bar.fontFamily
+            font.pixelSize: Style.font.bodySmall
+          }
+
+          Text {
+            visible: root.status.error !== ""
+            width: parent.width
+            text: "Apply failed — " + root.status.error
+            color: root.bar.foreground
+            wrapMode: Text.WordWrap
+            font.family: root.bar.fontFamily
+            font.pixelSize: Style.font.bodySmall
           }
         }
 
