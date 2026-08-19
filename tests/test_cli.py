@@ -151,6 +151,11 @@ class ThreeScreenEdidTests(unittest.TestCase):
         mons = [self.laptop, self.lg]
         self.assertEqual(cli.detect([self.two, self.three], mons)["id"], "remote-2-screen-4k")
 
+    def test_cloned_lg_1080p_is_arzopa(self):
+        self.assertTrue(cli.is_cloned_lg(self.esp_as_lg))
+        self.assertTrue(cli.is_cloned_lg(self.lg))
+        self.assertFalse(cli.is_cloned_lg(self.laptop))
+
 
 class ModelJsTests(unittest.TestCase):
     def test_plugin_dir_helper_shape(self):

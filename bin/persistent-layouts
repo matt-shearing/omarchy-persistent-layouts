@@ -328,6 +328,28 @@ def lua_string(value: str) -> str:
     return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
+def is_cloned_lg(mon: dict) -> bool:
+    blob = " ".join(str(mon.get(k) or "") for k in ("description", "make", "model")).lower()
+    return "sscr2" in blob or "lg tv" in blob
+
+
+def apply_monitor(name: str, mode: str, pos: str, scale: float) -> None:
+    expr = (
+        "hl.monitor({ output = %s, mode = %s, position = %s, scale = %.2f })"
+        % (lua_string(name), lua_string(mode), lua_string(pos), scale)
+    )
+    subprocess.check_call(["hyprctl", "eval", expr], stdout=subprocess.DEVNULL)
+
+
+def retrain_output(name: str) -> None:
+    """Arzopa-class HDMI portables clone a 4K LG EDID and stay dark until the link is bounced."""
+    subprocess.check_call(
+        ["hyprctl", "eval", "hl.monitor({ output = %s, disabled = true })" % lua_string(name)],
+        stdout=subprocess.DEVNULL,
+    )
+    subprocess.run(["sleep", "0.4"], check=False)
+
+
 def apply_profile(profile: dict) -> None:
     mons = hypr_monitors()
     mapping = assign_outputs(profile, mons, require_all_monitors=False)
@@ -339,14 +361,9 @@ def apply_profile(profile: dict) -> None:
         mode = check_mode(str(spec.get("mode") or "preferred"))
         pos = check_position(str(spec.get("position") or "auto"))
         scale = check_scale(spec.get("scale", 1))
-        expr = (
-            "hl.monitor({ output = %s, mode = %s, position = %s, scale = %.2f })"
-            % (lua_string(name), lua_string(mode), lua_string(pos), scale)
-        )
-        subprocess.check_call(
-            ["hyprctl", "eval", expr],
-            stdout=subprocess.DEVNULL,
-        )
+        if is_cloned_lg(mon) and spec_dims(spec) == "1920x1080":
+            retrain_output(name)
+        apply_monitor(name, mode, pos, scale)
         applied.append({"name": name, "mode": mode, "position": pos, "scale": scale})
     write_hyprmon(applied)
     STATE_DIR.mkdir(parents=True, exist_ok=True)
