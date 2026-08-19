@@ -1,0 +1,494 @@
+#!/usr/bin/env python3
+"""Save, apply, and autodetect Hyprland display layouts."""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+CONFIG_DIR = Path.home() / ".config/omarchy/persistent-layouts"
+PROFILE_DIR = CONFIG_DIR / "profiles"
+LEGACY_PROFILE_DIR = Path.home() / ".config/omarchy/display-profiles"
+CONFIG_PATH = CONFIG_DIR / "config.json"
+
+STATE_DIR = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "omarchy" / "persistent-layouts"
+LEGACY_STATE_DIR = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "omarchy"
+ACTIVE_PATH = STATE_DIR / "active"
+LAST_SET_PATH = STATE_DIR / "last-set"
+LEGACY_ACTIVE_PATH = LEGACY_STATE_DIR / "display-profile-active"
+LEGACY_LAST_SET_PATH = LEGACY_STATE_DIR / "display-profile-last-set"
+
+HYPRMON = Path.home() / ".config/hypr/hyprmon.lua"
+
+OUTPUT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$")
+MODE_RE = re.compile(r"^(preferred|\d{3,5}x\d{3,5}@\d{1,4}(?:\.\d{1,3})?)$")
+POS_RE = re.compile(r"^(auto|-?\d{1,6}x-?\d{1,6})$")
+
+
+def run_json(cmd: list[str]) -> object:
+    out = subprocess.check_output(cmd, text=True)
+    return json.loads(out)
+
+
+def hypr_monitors() -> list[dict]:
+    return list(run_json(["hyprctl", "-j", "monitors"]))
+
+
+def fingerprint(mon: dict) -> str:
+    make = str(mon.get("make") or "").strip()
+    model = str(mon.get("model") or "").strip()
+    if make and model:
+        return f"{make}|{model}"
+    desc = str(mon.get("description") or "").strip()
+    if desc:
+        return desc
+    return str(mon.get("name") or "").strip()
+
+
+def match_fingerprint(match: dict) -> str:
+    make = str(match.get("make") or "").strip()
+    model = str(match.get("model") or "").strip()
+    if make and model:
+        return f"{make}|{model}"
+    desc = str(match.get("description") or "").strip()
+    if desc:
+        return desc
+    return str(match.get("output_hint") or "").strip()
+
+
+def connected_set(mons: list[dict]) -> frozenset[str]:
+    return frozenset(fingerprint(m) for m in mons if fingerprint(m))
+
+
+def mode_string(mon: dict) -> str:
+    w, h = int(mon["width"]), int(mon["height"])
+    rr = float(mon.get("refreshRate") or 0)
+    if abs(rr - round(rr)) < 0.02:
+        return f"{w}x{h}@{int(round(rr))}.00"
+    return f"{w}x{h}@{rr:.2f}"
+
+
+def slugify(name: str) -> str:
+    s = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
+    return s or "layout"
+
+
+def ensure_layout_dirs() -> None:
+    PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    if not any(PROFILE_DIR.glob("*.json")) and LEGACY_PROFILE_DIR.is_dir():
+        for path in LEGACY_PROFILE_DIR.glob("*.json"):
+            dest = PROFILE_DIR / path.name
+            if not dest.exists():
+                shutil.copy2(path, dest)
+    if not ACTIVE_PATH.exists() and LEGACY_ACTIVE_PATH.exists():
+        ACTIVE_PATH.write_text(LEGACY_ACTIVE_PATH.read_text())
+    if not LAST_SET_PATH.exists() and LEGACY_LAST_SET_PATH.exists():
+        LAST_SET_PATH.write_text(LEGACY_LAST_SET_PATH.read_text())
+
+
+def default_config() -> dict:
+    return {"auto": True}
+
+
+def load_config() -> dict:
+    ensure_layout_dirs()
+    data = default_config()
+    try:
+        raw = json.loads(CONFIG_PATH.read_text())
+    except (OSError, json.JSONDecodeError):
+        return data
+    if isinstance(raw, dict):
+        data["auto"] = raw.get("auto") is not False
+    return data
+
+
+def write_config(cfg: dict) -> None:
+    ensure_layout_dirs()
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    CONFIG_PATH.write_text(json.dumps({"auto": bool(cfg.get("auto", True))}, indent=2) + "\n")
+
+
+def auto_enabled() -> bool:
+    return load_config().get("auto") is not False
+
+
+def load_profiles() -> list[dict]:
+    ensure_layout_dirs()
+    profiles = []
+    for path in sorted(PROFILE_DIR.glob("*.json")):
+        try:
+            data = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(data, dict) or not data.get("outputs"):
+            continue
+        data.setdefault("id", path.stem)
+        data["_path"] = str(path)
+        profiles.append(data)
+    return profiles
+
+
+def profile_set(profile: dict) -> frozenset[str]:
+    return frozenset(
+        match_fingerprint(o.get("match") or {})
+        for o in profile.get("outputs") or []
+        if match_fingerprint(o.get("match") or {})
+    )
+
+
+def write_profile(profile: dict) -> Path:
+    ensure_layout_dirs()
+    pid = profile["id"]
+    path = PROFILE_DIR / f"{pid}.json"
+    out = {k: v for k, v in profile.items() if not k.startswith("_")}
+    path.write_text(json.dumps(out, indent=2) + "\n")
+    return path
+
+
+def snapshot(name: str | None = None, pid: str | None = None) -> dict:
+    mons = hypr_monitors()
+    if not mons:
+        raise SystemExit("no monitors from hyprctl")
+    if not pid:
+        pid = slugify(name or f"{len(mons)}-screen")
+    if not name:
+        name = pid.replace("-", " ").title()
+    outputs = []
+    for mon in mons:
+        outputs.append(
+            {
+                "match": {
+                    "make": str(mon.get("make") or ""),
+                    "model": str(mon.get("model") or ""),
+                    "description": str(mon.get("description") or ""),
+                },
+                "output_hint": mon["name"],
+                "mode": mode_string(mon),
+                "scale": float(mon.get("scale") or 1),
+                "position": f'{int(mon["x"])}x{int(mon["y"])}',
+            }
+        )
+    return {
+        "id": pid,
+        "name": name,
+        "updated": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "outputs": outputs,
+    }
+
+
+def find_output(mons: list[dict], spec: dict) -> dict | None:
+    want = match_fingerprint(spec.get("match") or {})
+    if want:
+        for mon in mons:
+            if fingerprint(mon) == want:
+                return mon
+    hint = str(spec.get("output_hint") or "")
+    if hint:
+        for mon in mons:
+            if mon.get("name") == hint:
+                return mon
+    return None
+
+
+def check_output_name(name: str) -> str:
+    if not OUTPUT_RE.fullmatch(name):
+        raise SystemExit(f"refusing unsafe output name: {name!r}")
+    return name
+
+
+def check_mode(mode: str) -> str:
+    if not MODE_RE.fullmatch(mode):
+        raise SystemExit(f"refusing unsafe mode: {mode!r}")
+    return mode
+
+
+def check_position(pos: str) -> str:
+    if not POS_RE.fullmatch(pos):
+        raise SystemExit(f"refusing unsafe position: {pos!r}")
+    return pos
+
+
+def check_scale(scale: object) -> float:
+    try:
+        value = float(scale)
+    except (TypeError, ValueError):
+        raise SystemExit(f"refusing unsafe scale: {scale!r}") from None
+    if not 0.1 <= value <= 8.0:
+        raise SystemExit(f"refusing unsafe scale: {scale!r}")
+    return value
+
+
+def lua_string(value: str) -> str:
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def apply_profile(profile: dict) -> None:
+    mons = hypr_monitors()
+    applied = []
+    for spec in profile.get("outputs") or []:
+        mon = find_output(mons, spec)
+        if not mon:
+            raise SystemExit(f"missing output for {match_fingerprint(spec.get('match') or {})}")
+        name = check_output_name(str(mon["name"]))
+        mode = check_mode(str(spec.get("mode") or "preferred"))
+        pos = check_position(str(spec.get("position") or "auto"))
+        scale = check_scale(spec.get("scale", 1))
+        expr = (
+            "hl.monitor({ output = %s, mode = %s, position = %s, scale = %.2f })"
+            % (lua_string(name), lua_string(mode), lua_string(pos), scale)
+        )
+        subprocess.check_call(
+            ["hyprctl", "eval", expr],
+            stdout=subprocess.DEVNULL,
+        )
+        applied.append({"name": name, "mode": mode, "position": pos, "scale": scale})
+    write_hyprmon(applied)
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    ACTIVE_PATH.write_text(profile["id"] + "\n")
+    LAST_SET_PATH.write_text(json.dumps(sorted(connected_set(mons))) + "\n")
+
+
+def write_hyprmon(applied: list[dict]) -> None:
+    # Only refresh HyprMon's generated file. Do not create it for users who
+    # do not already use HyprMon, and do not edit monitors.lua.
+    if not HYPRMON.exists():
+        return
+    lines = ["-- Generated by HyprMon. Manual changes may be overwritten.", ""]
+    for item in applied:
+        mode = item["mode"]
+        if re.search(r"@\d+$", mode):
+            mode = mode + ".00"
+        mode = check_mode(mode)
+        lines.append(
+            "hl.monitor({ output = %s, mode = %s, position = %s, scale = %.2f })"
+            % (
+                lua_string(check_output_name(item["name"])),
+                lua_string(mode),
+                lua_string(check_position(item["position"])),
+                check_scale(item["scale"]),
+            )
+        )
+    HYPRMON.write_text("\n".join(lines) + "\n")
+
+
+def detect(profiles: list[dict], mons: list[dict]) -> dict | None:
+    connected = connected_set(mons)
+    if not connected:
+        return None
+    matches = [p for p in profiles if profile_set(p) == connected]
+    if not matches:
+        return None
+    matches.sort(key=lambda p: (-len(profile_set(p)), p.get("id") or ""))
+    return matches[0]
+
+
+def active_id() -> str:
+    try:
+        return ACTIVE_PATH.read_text().strip()
+    except OSError:
+        return ""
+
+
+def last_set() -> list[str]:
+    try:
+        data = json.loads(LAST_SET_PATH.read_text())
+        return list(data) if isinstance(data, list) else []
+    except (OSError, json.JSONDecodeError):
+        return []
+
+
+def status_payload() -> dict:
+    mons = hypr_monitors()
+    profiles = load_profiles()
+    connected = sorted(connected_set(mons))
+    match = detect(profiles, mons)
+    current = []
+    for mon in mons:
+        current.append(
+            {
+                "name": mon.get("name"),
+                "fingerprint": fingerprint(mon),
+                "description": mon.get("description"),
+                "mode": mode_string(mon),
+                "scale": mon.get("scale"),
+                "position": f'{int(mon["x"])}x{int(mon["y"])}',
+            }
+        )
+    listed = []
+    for p in profiles:
+        pset = sorted(profile_set(p))
+        listed.append(
+            {
+                "id": p.get("id"),
+                "name": p.get("name") or p.get("id"),
+                "outputs": len(p.get("outputs") or []),
+                "fingerprints": pset,
+                "matches": pset == connected,
+                "active": p.get("id") == active_id(),
+            }
+        )
+    return {
+        "ok": True,
+        "connected": connected,
+        "current": current,
+        "active": active_id(),
+        "detected": (match or {}).get("id"),
+        "profiles": listed,
+        "auto": auto_enabled(),
+    }
+
+
+def cmd_save(args: argparse.Namespace) -> int:
+    existing = {p["id"]: p for p in load_profiles()}
+    name = args.name
+    pid = args.id
+    if not pid and args.update_matching:
+        snap = snapshot(name)
+        match = next((p for p in existing.values() if profile_set(p) == profile_set(snap)), None)
+        if match:
+            pid = match["id"]
+            name = name or match.get("name")
+    snap = snapshot(name, pid)
+    if snap["id"] in existing and name is None:
+        snap["name"] = existing[snap["id"]].get("name") or snap["name"]
+    path = write_profile(snap)
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    ACTIVE_PATH.write_text(snap["id"] + "\n")
+    LAST_SET_PATH.write_text(json.dumps(sorted(profile_set(snap))) + "\n")
+    if args.json:
+        print(json.dumps({"ok": True, "id": snap["id"], "path": str(path)}, indent=2))
+    else:
+        print(f"saved {snap['id']} ({len(snap['outputs'])} outputs) -> {path}")
+    return 0
+
+
+def cmd_apply(args: argparse.Namespace) -> int:
+    profiles = {p["id"]: p for p in load_profiles()}
+    if args.name not in profiles:
+        raise SystemExit(f"unknown profile: {args.name}")
+    apply_profile(profiles[args.name])
+    if args.json:
+        print(json.dumps({"ok": True, "id": args.name}))
+    else:
+        print(f"applied {args.name}")
+    return 0
+
+
+def cmd_list(args: argparse.Namespace) -> int:
+    payload = status_payload()
+    if args.json:
+        print(json.dumps(payload, indent=2))
+        return 0
+    for p in payload["profiles"]:
+        mark = "*" if p["active"] else ("~" if p["matches"] else " ")
+        print(f"{mark} {p['id']:24} {p['name']}  ({p['outputs']} outputs)")
+    return 0
+
+
+def cmd_detect(args: argparse.Namespace) -> int:
+    mons = hypr_monitors()
+    profiles = load_profiles()
+    match = detect(profiles, mons)
+    connected = sorted(connected_set(mons))
+    if args.apply:
+        if not auto_enabled():
+            if args.json:
+                print(json.dumps({"ok": True, "applied": False, "reason": "auto-off", "connected": connected}))
+            return 0
+        if not match:
+            if args.json:
+                print(json.dumps({"ok": False, "applied": False, "reason": "no-match", "connected": connected}))
+            return 1
+        if match["id"] == active_id() and last_set() == connected:
+            if args.json:
+                print(json.dumps({"ok": True, "applied": False, "id": match["id"], "reason": "already"}))
+            return 0
+        apply_profile(match)
+        if args.json:
+            print(json.dumps({"ok": True, "applied": True, "id": match["id"]}))
+        else:
+            print(f"detected {match['id']}")
+        return 0
+    if args.json:
+        print(json.dumps({"ok": True, "id": (match or {}).get("id"), "connected": connected}))
+        return 0 if match else 1
+    if not match:
+        print("no matching profile")
+        return 1
+    print(match["id"])
+    return 0
+
+
+def cmd_status(_args: argparse.Namespace) -> int:
+    print(json.dumps(status_payload(), indent=2))
+    return 0
+
+
+def cmd_auto(args: argparse.Namespace) -> int:
+    cfg = load_config()
+    if args.state is None:
+        if args.json:
+            print(json.dumps({"ok": True, "auto": cfg["auto"]}))
+        else:
+            print("on" if cfg["auto"] else "off")
+        return 0
+    cfg["auto"] = args.state in {"on", "true", "1"}
+    write_config(cfg)
+    if args.json:
+        print(json.dumps({"ok": True, "auto": cfg["auto"]}))
+    else:
+        print("on" if cfg["auto"] else "off")
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--json", action="store_true")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    p_save = sub.add_parser("save", help="save the current layout")
+    p_save.add_argument("id", nargs="?", help="profile id")
+    p_save.add_argument("--id", dest="id_opt", help=argparse.SUPPRESS)
+    p_save.add_argument("--name", help="display name")
+    p_save.add_argument("--update-matching", action="store_true")
+    p_save.add_argument("--json", action="store_true")
+    p_save.set_defaults(func=cmd_save)
+
+    p_apply = sub.add_parser("apply", help="apply a saved profile")
+    p_apply.add_argument("name")
+    p_apply.add_argument("--json", action="store_true")
+    p_apply.set_defaults(func=cmd_apply)
+
+    p_list = sub.add_parser("list", help="list profiles")
+    p_list.add_argument("--json", action="store_true")
+    p_list.set_defaults(func=cmd_list)
+
+    p_detect = sub.add_parser("detect", help="find the profile for the connected set")
+    p_detect.add_argument("--apply", action="store_true")
+    p_detect.add_argument("--json", action="store_true")
+    p_detect.set_defaults(func=cmd_detect)
+
+    p_status = sub.add_parser("status", help="JSON status for the bar applet")
+    p_status.add_argument("--json", action="store_true")
+    p_status.set_defaults(func=cmd_status)
+
+    p_auto = sub.add_parser("auto", help="show or set auto-apply on plug-in")
+    p_auto.add_argument("state", nargs="?", choices=["on", "off", "true", "false", "1", "0"])
+    p_auto.add_argument("--json", action="store_true")
+    p_auto.set_defaults(func=cmd_auto)
+
+    args = parser.parse_args()
+    if getattr(args, "id_opt", None) and not args.id:
+        args.id = args.id_opt
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
