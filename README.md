@@ -1,5 +1,7 @@
 # Persistent Layouts
 
+![Persistent Layouts in the Omarchy bar](preview.png)
+
 Save a Hyprland desk. Get it back when the same screens plug in.
 
 Persistent Layouts is an [Omarchy](https://omarchy.org) bar widget for people who move between setups: laptop only, a dock at home, a TV on the road. It remembers each named layout and restores the matching one automatically.
