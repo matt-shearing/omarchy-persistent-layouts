@@ -71,6 +71,87 @@ class FingerprintTests(unittest.TestCase):
         self.assertIsNone(cli.detect([profile], connected))
 
 
+class ThreeScreenEdidTests(unittest.TestCase):
+    """Laptop + 4K LG + 1080p panel that cloned the LG EDID."""
+
+    laptop = {
+        "name": "eDP-2",
+        "make": "BOE",
+        "model": "NE160QDM-NZ6",
+        "description": "BOE NE160QDM-NZ6",
+        "width": 2560,
+        "height": 1600,
+        "refreshRate": 165.0,
+        "x": 0,
+        "y": 0,
+        "scale": 1.25,
+    }
+    lg = {
+        "name": "DP-5",
+        "make": "LG Electronics",
+        "model": "LG TV SSCR2",
+        "description": "LG Electronics LG TV SSCR2 0x01010101",
+        "width": 3840,
+        "height": 2160,
+        "refreshRate": 60.0,
+        "x": -2400,
+        "y": 0,
+        "scale": 1.6,
+    }
+    esp_as_lg = {
+        "name": "DP-3",
+        "make": "LG Electronics",
+        "model": "LG TV SSCR2",
+        "description": "LG Electronics LG TV SSCR2 0x01010101",
+        "width": 1920,
+        "height": 1080,
+        "refreshRate": 60.0,
+        "x": 32,
+        "y": -1080,
+        "scale": 1.0,
+    }
+
+    two = {
+        "id": "remote-2-screen-4k",
+        "outputs": [
+            {"match": {"make": "BOE", "model": "NE160QDM-NZ6"}, "mode": "2560x1600@165.00"},
+            {"match": {"make": "LG Electronics", "model": "LG TV SSCR2"}, "mode": "3840x2160@60.00"},
+        ],
+    }
+    three = {
+        "id": "remote-3-screen",
+        "outputs": [
+            {"match": {"make": "BOE", "model": "NE160QDM-NZ6"}, "mode": "2560x1600@165.00"},
+            {
+                "match": {"make": "ESP", "model": "eD15(2024)", "description": "ESP eD15(2024) 0x00032867"},
+                "mode": "1920x1080@60.00",
+                "output_hint": "DP-3",
+            },
+            {"match": {"make": "LG Electronics", "model": "LG TV SSCR2"}, "mode": "3840x2160@60.00"},
+        ],
+    }
+
+    def test_three_screens_do_not_match_two_screen_profile(self):
+        mons = [self.laptop, self.lg, self.esp_as_lg]
+        self.assertIsNone(cli.assign_outputs(self.two, mons, require_all_monitors=True))
+        self.assertEqual(cli.detect([self.two, self.three], mons)["id"], "remote-3-screen")
+
+    def test_cloned_edid_uses_resolution(self):
+        mons = [self.laptop, self.lg, self.esp_as_lg]
+        mapping = cli.assign_outputs(self.three, mons, require_all_monitors=True)
+        by_model = {
+            (spec.get("match") or {}).get("model"): mon["name"]
+            for spec, mon in mapping
+        }
+        self.assertEqual(by_model["NE160QDM-NZ6"], "eDP-2")
+        self.assertEqual(by_model["LG TV SSCR2"], "DP-5")
+        self.assertEqual(by_model["eD15(2024)"], "DP-3")
+
+    def test_two_screens_still_match_two_profile(self):
+        mons = [self.laptop, self.lg]
+        self.assertEqual(cli.detect([self.two, self.three], mons)["id"], "remote-2-screen-4k")
+
+
 class ModelJsTests(unittest.TestCase):
     def test_plugin_dir_helper_shape(self):
         text = (ROOT / "Model.js").read_text()

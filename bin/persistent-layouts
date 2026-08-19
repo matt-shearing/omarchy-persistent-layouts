@@ -183,18 +183,117 @@ def snapshot(name: str | None = None, pid: str | None = None) -> dict:
     }
 
 
-def find_output(mons: list[dict], spec: dict) -> dict | None:
-    want = match_fingerprint(spec.get("match") or {})
-    if want:
-        for mon in mons:
-            if fingerprint(mon) == want:
-                return mon
+def mode_dims_from_string(mode: str) -> str:
+    m = re.match(r"(\d+)x(\d+)", str(mode or ""))
+    return f"{m.group(1)}x{m.group(2)}" if m else ""
+
+
+def mode_dims(mon: dict) -> str:
+    try:
+        return f"{int(mon['width'])}x{int(mon['height'])}"
+    except (KeyError, TypeError, ValueError):
+        return mode_dims_from_string(mode_string(mon))
+
+
+def spec_dims(spec: dict) -> str:
+    return mode_dims_from_string(str(spec.get("mode") or ""))
+
+
+def topology_key(mons: list[dict]) -> list[str]:
+    return sorted(f"{fingerprint(m)}|{mode_dims(m)}" for m in mons)
+
+
+def assignment_score(spec: dict, mon: dict) -> int:
+    score = 0
+    match = spec.get("match") or {}
+    want_fp = match_fingerprint(match)
+    got_fp = fingerprint(mon)
+    if want_fp and got_fp == want_fp:
+        score += 100
+    want_desc = str(match.get("description") or "").strip()
+    got_desc = str(mon.get("description") or "")
+    if want_desc and want_desc == got_desc:
+        score += 50
+    elif want_desc and want_desc in got_desc:
+        score += 30
+    want_model = str(match.get("model") or "").strip()
+    if want_model and want_model in got_desc:
+        score += 20
+    want_dims = spec_dims(spec)
+    if want_dims and want_dims == mode_dims(mon):
+        score += 40
+    want_mode = str(spec.get("mode") or "")
+    if want_mode and want_mode == mode_string(mon):
+        score += 15
     hint = str(spec.get("output_hint") or "")
-    if hint:
-        for mon in mons:
-            if mon.get("name") == hint:
-                return mon
-    return None
+    if hint and mon.get("name") == hint:
+        score += 8
+    return score
+
+
+def assign_outputs(
+    profile: dict, mons: list[dict], require_all_monitors: bool = True
+) -> list[tuple[dict, dict]] | None:
+    """Map each profile output to a unique live monitor.
+
+    Same make|model on two panels (cloned EDID) is disambiguated by
+    resolution. A leftover panel can fill a missing identity so a 3-screen
+    desk still matches when one EDID is wrong. Detect requires a 1:1
+    mapping; apply only requires every saved output to be placed.
+    """
+    specs = list(profile.get("outputs") or [])
+    if not specs or not mons:
+        return None
+    if require_all_monitors and len(specs) != len(mons):
+        return None
+
+    pairs: list[tuple[int, int, int]] = []
+    for si, spec in enumerate(specs):
+        for mi, mon in enumerate(mons):
+            pairs.append((-assignment_score(spec, mon), si, mi))
+    pairs.sort()
+
+    used_s: set[int] = set()
+    used_m: set[int] = set()
+    mapping: dict[int, dict] = {}
+    for _neg, si, mi in pairs:
+        if si in used_s or mi in used_m:
+            continue
+        if assignment_score(specs[si], mons[mi]) <= 0:
+            continue
+        used_s.add(si)
+        used_m.add(mi)
+        mapping[si] = mons[mi]
+
+    leftover_s = [i for i in range(len(specs)) if i not in used_s]
+    leftover_m = [i for i in range(len(mons)) if i not in used_m]
+    if leftover_s:
+        if require_all_monitors and len(leftover_s) != len(leftover_m):
+            return None
+        rem = []
+        for si in leftover_s:
+            for mi in leftover_m:
+                rem.append((-assignment_score(specs[si], mons[mi]), si, mi))
+        rem.sort()
+        for _neg, si, mi in rem:
+            if si in used_s or mi in used_m:
+                continue
+            used_s.add(si)
+            used_m.add(mi)
+            mapping[si] = mons[mi]
+        if len(mapping) != len(specs):
+            return None
+
+    if require_all_monitors and len(mapping) != len(mons):
+        return None
+    return [(specs[i], mapping[i]) for i in range(len(specs))]
+
+
+def find_output(mons: list[dict], spec: dict) -> dict | None:
+    mapping = assign_outputs({"outputs": [spec]}, mons, require_all_monitors=False)
+    if not mapping:
+        return None
+    return mapping[0][1]
 
 
 def check_output_name(name: str) -> str:
@@ -231,11 +330,11 @@ def lua_string(value: str) -> str:
 
 def apply_profile(profile: dict) -> None:
     mons = hypr_monitors()
+    mapping = assign_outputs(profile, mons, require_all_monitors=False)
+    if not mapping:
+        raise SystemExit("could not match saved outputs to the connected screens")
     applied = []
-    for spec in profile.get("outputs") or []:
-        mon = find_output(mons, spec)
-        if not mon:
-            raise SystemExit(f"missing output for {match_fingerprint(spec.get('match') or {})}")
+    for spec, mon in mapping:
         name = check_output_name(str(mon["name"]))
         mode = check_mode(str(spec.get("mode") or "preferred"))
         pos = check_position(str(spec.get("position") or "auto"))
@@ -252,7 +351,7 @@ def apply_profile(profile: dict) -> None:
     write_hyprmon(applied)
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     ACTIVE_PATH.write_text(profile["id"] + "\n")
-    LAST_SET_PATH.write_text(json.dumps(sorted(connected_set(mons))) + "\n")
+    LAST_SET_PATH.write_text(json.dumps(topology_key(mons)) + "\n")
 
 
 def write_hyprmon(applied: list[dict]) -> None:
@@ -279,14 +378,19 @@ def write_hyprmon(applied: list[dict]) -> None:
 
 
 def detect(profiles: list[dict], mons: list[dict]) -> dict | None:
-    connected = connected_set(mons)
-    if not connected:
+    if not mons:
         return None
-    matches = [p for p in profiles if profile_set(p) == connected]
-    if not matches:
+    scored: list[tuple[int, int, str, dict]] = []
+    for profile in profiles:
+        mapping = assign_outputs(profile, mons, require_all_monitors=True)
+        if not mapping:
+            continue
+        total = sum(assignment_score(spec, mon) for spec, mon in mapping)
+        scored.append((total, len(profile.get("outputs") or []), str(profile.get("id") or ""), profile))
+    if not scored:
         return None
-    matches.sort(key=lambda p: (-len(profile_set(p)), p.get("id") or ""))
-    return matches[0]
+    scored.sort(reverse=True)
+    return scored[0][3]
 
 
 def active_id() -> str:
@@ -299,7 +403,7 @@ def active_id() -> str:
 def last_set() -> list[str]:
     try:
         data = json.loads(LAST_SET_PATH.read_text())
-        return list(data) if isinstance(data, list) else []
+        return [str(x) for x in data] if isinstance(data, list) else []
     except (OSError, json.JSONDecodeError):
         return []
 
@@ -307,7 +411,7 @@ def last_set() -> list[str]:
 def status_payload() -> dict:
     mons = hypr_monitors()
     profiles = load_profiles()
-    connected = sorted(connected_set(mons))
+    connected = sorted(fingerprint(m) for m in mons)
     match = detect(profiles, mons)
     current = []
     for mon in mons:
@@ -330,7 +434,7 @@ def status_payload() -> dict:
                 "name": p.get("name") or p.get("id"),
                 "outputs": len(p.get("outputs") or []),
                 "fingerprints": pset,
-                "matches": pset == connected,
+                "matches": assign_outputs(p, mons, require_all_monitors=True) is not None,
                 "active": p.get("id") == active_id(),
             }
         )
@@ -351,7 +455,14 @@ def cmd_save(args: argparse.Namespace) -> int:
     pid = args.id
     if not pid and args.update_matching:
         snap = snapshot(name)
-        match = next((p for p in existing.values() if profile_set(p) == profile_set(snap)), None)
+        match = next(
+            (
+                p
+                for p in existing.values()
+                if assign_outputs(p, hypr_monitors(), require_all_monitors=True) is not None
+            ),
+            None,
+        )
         if match:
             pid = match["id"]
             name = name or match.get("name")
@@ -361,7 +472,7 @@ def cmd_save(args: argparse.Namespace) -> int:
     path = write_profile(snap)
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     ACTIVE_PATH.write_text(snap["id"] + "\n")
-    LAST_SET_PATH.write_text(json.dumps(sorted(profile_set(snap))) + "\n")
+    LAST_SET_PATH.write_text(json.dumps(topology_key(hypr_monitors())) + "\n")
     if args.json:
         print(json.dumps({"ok": True, "id": snap["id"], "path": str(path)}, indent=2))
     else:
@@ -396,7 +507,7 @@ def cmd_detect(args: argparse.Namespace) -> int:
     mons = hypr_monitors()
     profiles = load_profiles()
     match = detect(profiles, mons)
-    connected = sorted(connected_set(mons))
+    connected = sorted(fingerprint(m) for m in mons)
     if args.apply:
         if not auto_enabled():
             if args.json:
@@ -406,7 +517,7 @@ def cmd_detect(args: argparse.Namespace) -> int:
             if args.json:
                 print(json.dumps({"ok": False, "applied": False, "reason": "no-match", "connected": connected}))
             return 1
-        if match["id"] == active_id() and last_set() == connected:
+        if match["id"] == active_id() and last_set() == topology_key(mons):
             if args.json:
                 print(json.dumps({"ok": True, "applied": False, "id": match["id"], "reason": "already"}))
             return 0
