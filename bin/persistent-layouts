@@ -44,6 +44,21 @@ POS_RE = re.compile(r"^(auto|-?\d{1,6}x-?\d{1,6})$")
 # How long to let Hyprland settle before reading back what actually applied.
 SETTLE_SECONDS = 0.6
 
+# hyprctl can block forever on a wedged DRM commit (Framework HDMI after a
+# long s2idle). Bound every compositor call so auto-apply can retry later.
+HYPRCTL_TIMEOUT = ["timeout", "--kill-after=1s", "5s"]
+
+
+def hyprctl(args: list[str], capture: bool = False) -> str:
+    cmd = HYPRCTL_TIMEOUT + ["hyprctl", *args]
+    try:
+        if capture:
+            return subprocess.check_output(cmd, text=True)
+        subprocess.check_call(cmd, stdout=subprocess.DEVNULL)
+        return ""
+    except subprocess.CalledProcessError as exc:
+        raise SystemExit(f"hyprctl timed out or failed: {' '.join(args)}") from exc
+
 
 def run_json(cmd: list[str]) -> object:
     out = subprocess.check_output(cmd, text=True)
@@ -51,7 +66,7 @@ def run_json(cmd: list[str]) -> object:
 
 
 def hypr_monitors() -> list[dict]:
-    return list(run_json(["hyprctl", "-j", "monitors"]))
+    return list(json.loads(hyprctl(["-j", "monitors"], capture=True)))
 
 
 # --------------------------------------------------------------------------
@@ -466,7 +481,7 @@ def apply_monitor(name: str, mode: str, pos: str, scale: float) -> None:
         "hl.monitor({ output = %s, mode = %s, position = %s, scale = %.2f })"
         % (lua_string(name), lua_string(mode), lua_string(pos), scale)
     )
-    subprocess.check_call(["hyprctl", "eval", expr], stdout=subprocess.DEVNULL)
+    hyprctl(["eval", expr])
 
 
 def apply_profile(profile: dict) -> list[str]:

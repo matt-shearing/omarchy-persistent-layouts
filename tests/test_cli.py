@@ -160,6 +160,13 @@ class DeskTests(unittest.TestCase):
         self.assertEqual(by_model["eD15(2024)"], "DP-3")
         self.assertEqual(by_model["LG TV SSCR2"], "DP-5")
 
+    def test_gwd_arzopa_identity_is_not_the_fake_lg(self):
+        """Cold-boot Arzopa EDID is GWD|ARZOPA; that is a different desk than the cloned LG blob."""
+        gwd = mon("DP-5", "GWD", "ARZOPA", 1920, 1080, -1920, 0, 1.0, "000000000000")
+        mons = [self.laptop, self.espresso, gwd]
+        self.assertFalse(cli.profile_matches_topology(self.three, mons))
+        self.assertIsNone(cli.detect([self.two, self.three], mons))
+
     def test_leftover_monitor_is_never_conscripted(self):
         """A 1-output profile must not absorb an unrelated second display."""
         one = {
