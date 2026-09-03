@@ -46,7 +46,10 @@ its own:
   for that set. Auto-apply will not overrule it on the next hotplug.
 - Dummy amdgpu EDIDs (`The Linux Foundation` / `Linux FHD`) that appear as
   connected 0×0 sinks after sleep are ignored and disabled. They are not a
-  panel; leaving them enabled steals a CRTC from the laptop display.
+  panel; leaving them enabled steals a CRTC from the laptop display. If I2C
+  still reads a real portable (`GWD ARZOPA`, the fake `LG TV SSCR2` blob, or
+  the espresso) on that connector, the dummy is treated as that panel and
+  driven at the saved 1080p mode instead of being disabled.
 
 ## Install
 

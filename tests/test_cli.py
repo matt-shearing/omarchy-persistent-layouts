@@ -296,6 +296,41 @@ class DummyEdidTests(unittest.TestCase):
         mons = cli.real_monitors([self.laptop, espresso, self.dummy])
         self.assertIsNone(cli.detect([self.one], mons))
 
+    def test_parse_gwd_arzopa_edid(self):
+        blob = bytes.fromhex(
+            "00ffffffffffff001ee45601050232092f210103802313783aef65a656529d28"
+            "0b5054210800d1c07140818095009040a9c0814081c0023a801871382d40582c"
+            "250058c11000001e000000fc0041525a4f50410a202020202020000000ff0030"
+            "30303030303030303030300a000000fd002f4b185413010a20202020202001e5"
+        )
+        parsed = cli.parse_edid(blob)
+        self.assertEqual(parsed["make"], "GWD")
+        self.assertEqual(parsed["model"], "ARZOPA")
+
+    def test_dummy_with_i2c_arzopa_is_the_travel_desk(self):
+        espresso = mon("DP-4", "ESP", "eD15(2024)", 1920, 1080, 2048, 200, 1.0, "0x00032867")
+        recovered = cli.recover_dummy_identity(
+            self.dummy2, reader=lambda _name: {"make": "GWD", "model": "ARZOPA", "serial": "000000000000", "description": "GWD ARZOPA 000000000000"}
+        )
+        self.assertFalse(cli.is_dummy_monitor(recovered))
+        self.assertEqual(cli.fingerprint(recovered), "GWD|ARZOPA")
+        travel = {
+            "id": "travel-3-screen",
+            "outputs": [
+                spec("BOE", "NE160QDM-NZ6", "2560x1600@165.00", 1.25, "0x0"),
+                spec("ESP", "eD15(2024)", "1920x1080@60.00", 1.0, "2048x200"),
+                spec("GWD", "ARZOPA", "1920x1080@60.00", 1.0, "-1920x0"),
+            ],
+        }
+        mons = cli.real_monitors([self.laptop, espresso, recovered])
+        self.assertEqual(cli.detect([self.one, travel], mons)["id"], "travel-3-screen")
+
+    def test_dummy_without_i2c_stays_dummy(self):
+        recovered = cli.recover_dummy_identity(self.dummy, reader=lambda _name: None)
+        self.assertTrue(cli.is_dummy_monitor(recovered))
+        mons = cli.real_monitors([self.laptop, recovered])
+        self.assertEqual(cli.detect([self.one], mons)["id"], "laptop-only")
+
 
 class ModelJsTests(unittest.TestCase):
     def test_helpers_exist(self):

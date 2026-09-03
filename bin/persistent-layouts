@@ -11,6 +11,7 @@ and is remembered for that set.
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import os
 import re
@@ -66,7 +67,17 @@ def run_json(cmd: list[str]) -> object:
 
 
 def hypr_monitors() -> list[dict]:
-    return list(json.loads(hyprctl(["-j", "monitors"], capture=True)))
+    """Live connectors, including disabled ones, with dummy EDIDs recovered.
+
+    `hyprctl -j monitors` omits disabled heads, so a dummy-masked Arzopa would
+    vanish from matching and never get a 1080p modeset. `monitors all` plus an
+    I2C EDID overlay is what lets the saved desk win after s2idle.
+    """
+    try:
+        raw = hyprctl(["-j", "monitors", "all"], capture=True)
+    except SystemExit:
+        raw = hyprctl(["-j", "monitors"], capture=True)
+    return [recover_dummy_identity(m) for m in json.loads(raw)]
 
 
 # --------------------------------------------------------------------------
@@ -91,6 +102,154 @@ def is_dummy_monitor(mon: dict) -> bool:
 
 def real_monitors(mons: list[dict]) -> list[dict]:
     return [m for m in mons if not is_dummy_monitor(m)]
+
+
+# PNP three-letter codes vs the make Hyprland uses for the same panel.
+PNP_MAKE = {
+    "GWD": "GWD",
+    "ESP": "ESP",
+    "GSM": "LG Electronics",
+    "BOE": "BOE",
+    "LNX": "The Linux Foundation",
+}
+
+I2C_SLAVE = 0x0703
+_EDID_CACHE: dict[str, dict | None] = {}
+
+
+def parse_edid(data: bytes) -> dict | None:
+    """Make/model/serial from a 128-byte EDID block. None if the blob is junk."""
+    if not data or len(data) < 128:
+        return None
+    if data[:8] != b"\x00\xff\xff\xff\xff\xff\xff\x00":
+        return None
+    mfg = (data[8] << 8) | data[9]
+
+    def letter(v: int) -> str:
+        v = v & 0x1F
+        return chr(v + 64) if 1 <= v <= 26 else "?"
+
+    pnp = letter(mfg >> 10) + letter(mfg >> 5) + letter(mfg)
+    make = PNP_MAKE.get(pnp, pnp)
+    name = ""
+    serial_str = ""
+    for i in range(4):
+        d = data[54 + i * 18 : 72 + i * 18]
+        if len(d) < 18:
+            break
+        if d[0] == 0 and d[1] == 0 and d[3] == 0xFC:
+            name = d[5:].split(b"\n")[0].decode("ascii", "replace").strip()
+        if d[0] == 0 and d[1] == 0 and d[3] == 0xFF:
+            serial_str = d[5:].split(b"\n")[0].decode("ascii", "replace").strip()
+    raw_serial = data[12] | (data[13] << 8) | (data[14] << 16) | (data[15] << 24)
+    model = name or pnp
+    serial = serial_str or (f"0x{raw_serial:08x}" if raw_serial else "")
+    desc = f"{make} {model}".strip()
+    if serial:
+        desc = f"{desc} {serial}"
+    return {"make": make, "model": model, "serial": serial, "description": desc, "pnp": pnp}
+
+
+def i2c_dev_nodes(output: str) -> list[Path]:
+    if not OUTPUT_RE.fullmatch(output or ""):
+        return []
+    drm = Path("/sys/class/drm")
+    nodes: list[Path] = []
+    seen: set[str] = set()
+    for conn in sorted(drm.glob(f"card*-{output}")):
+        candidates = []
+        ddc = conn / "ddc"
+        if ddc.exists():
+            candidates.append(ddc)
+        candidates.extend(sorted(conn.glob("i2c-*")))
+        for child in candidates:
+            try:
+                name = child.resolve().name if child.is_symlink() else child.name
+            except OSError:
+                name = child.name
+            if not name.startswith("i2c-"):
+                continue
+            dev = Path("/dev") / name
+            key = str(dev)
+            if dev.exists() and key not in seen:
+                seen.add(key)
+                nodes.append(dev)
+    return nodes
+
+
+def read_i2c_edid(dev: Path) -> bytes | None:
+    try:
+        fd = os.open(dev, os.O_RDWR)
+    except OSError:
+        return None
+    try:
+        fcntl.ioctl(fd, I2C_SLAVE, 0x50)
+        os.write(fd, b"\x00")
+        time.sleep(0.02)
+        data = os.read(fd, 128)
+    except OSError:
+        return None
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+    return data if data else None
+
+
+def read_output_edid(output: str) -> dict | None:
+    """First non-dummy EDID on the connector's I2C/DDC buses."""
+    if output in _EDID_CACHE:
+        return _EDID_CACHE[output]
+    parsed = None
+    for dev in i2c_dev_nodes(output):
+        blob = read_i2c_edid(dev)
+        if not blob:
+            continue
+        got = parse_edid(blob)
+        if not got:
+            continue
+        if got.get("pnp") == "LNX" or "Linux FHD" in str(got.get("model") or ""):
+            continue
+        parsed = got
+        break
+    _EDID_CACHE[output] = parsed
+    return parsed
+
+
+def recover_dummy_identity(mon: dict, reader=None) -> dict:
+    """If Hyprland has Linux FHD but I2C has a real panel, use the real identity.
+
+    After s2idle amdgpu often fails the connector EDID (`EDID err: 2`) and
+    leaves a dummy sink. Persistent Layouts then disables it so it cannot steal
+    a CRTC — and the Arzopa, which is on the wire, stays dark. The panel still
+    answers on the AUX/I2C bus. Overlay that identity so the 1080p desk matches
+    and the dummy is not disabled.
+    """
+    if not is_dummy_monitor(mon):
+        return mon
+    name = str(mon.get("name") or "")
+    parsed = (reader or read_output_edid)(name)
+    if not parsed:
+        return mon
+    model = str(parsed.get("model") or "")
+    make = str(parsed.get("make") or "")
+    if make == "The Linux Foundation" or "Linux FHD" in model:
+        return mon
+    known = model in {"ARZOPA", "LG TV SSCR2", "eD15(2024)"} or make in {
+        "GWD",
+        "ESP",
+        "LG Electronics",
+    }
+    if not known:
+        return mon
+    out = dict(mon)
+    out["_recovered_from_dummy"] = True
+    out["make"] = parsed["make"]
+    out["model"] = parsed["model"]
+    out["serial"] = parsed.get("serial") or ""
+    out["description"] = parsed["description"]
+    return out
 
 
 def fingerprint(mon: dict) -> str:
@@ -516,6 +675,7 @@ def disable_dummy_outputs() -> list[str]:
         return []
     names: list[str] = []
     for mon in mons:
+        mon = recover_dummy_identity(mon)
         if not is_dummy_monitor(mon) or mon.get("disabled"):
             continue
         name = str(mon.get("name") or "")
@@ -535,9 +695,20 @@ def disable_dummy_outputs() -> list[str]:
     return names
 
 
-def apply_monitor(name: str, mode: str, pos: str, scale: float) -> None:
+def apply_monitor(
+    name: str, mode: str, pos: str, scale: float, recovered: bool = False
+) -> None:
+    if recovered:
+        # monitors.lua's last matching rule disables Linux FHD. A connector
+        # name eval is ignored until that desc rule is cleared.
+        hyprctl(
+            [
+                "eval",
+                'hl.monitor({ output = "desc:The Linux Foundation Linux FHD", disabled = false })',
+            ]
+        )
     expr = (
-        "hl.monitor({ output = %s, mode = %s, position = %s, scale = %.2f })"
+        "hl.monitor({ output = %s, mode = %s, position = %s, scale = %.2f, disabled = false })"
         % (lua_string(name), lua_string(mode), lua_string(pos), scale)
     )
     hyprctl(["eval", expr])
@@ -551,22 +722,41 @@ def apply_profile(profile: dict) -> list[str]:
     claims what it can actually verify: that the compositor is now driving the
     geometry the profile asked for.
     """
-    disable_dummy_outputs()
     mons = real_monitors(hypr_monitors())
     mapping = assign_outputs(profile, mons)
     if not mapping:
         raise SystemExit("could not match saved outputs to the connected screens")
 
+    disable_dummy_outputs()
+
+    def apply_rank(item: tuple[dict, dict]) -> int:
+        name = str(item[1].get("name") or "")
+        if name.startswith("eDP"):
+            return 0
+        if item[1].get("_recovered_from_dummy"):
+            return 2
+        return 1
+
+    mapping = sorted(mapping, key=apply_rank)
+
     applied = []
     for spec, mon in mapping:
         name = check_output_name(str(mon["name"]))
         mode = check_mode(str(spec.get("mode") or "preferred"))
+        # Dummy-masked Arzopa still advertises whatever the scaler likes.
+        # Never take "preferred" on a recovered sink — that is how 4K blanks it.
+        if mon.get("_recovered_from_dummy") and mode == "preferred":
+            mode = "1920x1080@60"
         pos = check_position(str(spec.get("position") or "auto"))
         scale = check_scale(spec.get("scale", 1))
-        apply_monitor(name, mode, pos, scale)
+        apply_monitor(name, mode, pos, scale, recovered=bool(mon.get("_recovered_from_dummy")))
         applied.append(
             {"name": name, "mode": mode, "position": pos, "scale": scale, "spec": spec}
         )
+
+    # Clearing the Linux FHD desc rule can re-enable a true dummy on another
+    # connector. Kill those again; recovered sinks are no longer dummy.
+    disable_dummy_outputs()
 
     time.sleep(SETTLE_SECONDS)
     after = {m["name"]: m for m in hypr_monitors()}
@@ -815,8 +1005,6 @@ def cmd_list(args: argparse.Namespace) -> int:
 
 
 def cmd_detect(args: argparse.Namespace) -> int:
-    if args.apply:
-        disable_dummy_outputs()
     mons = real_monitors(hypr_monitors())
     profiles = load_profiles()
     match = detect(profiles, mons)
