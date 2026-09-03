@@ -44,6 +44,9 @@ its own:
   same make and model are still tellable apart.
 - If more than one saved layout fits the connected set, clicking one **pins** it
   for that set. Auto-apply will not overrule it on the next hotplug.
+- Dummy amdgpu EDIDs (`The Linux Foundation` / `Linux FHD`) that appear as
+  connected 0×0 sinks after sleep are ignored and disabled. They are not a
+  panel; leaving them enabled steals a CRTC from the laptop display.
 
 ## Install
 

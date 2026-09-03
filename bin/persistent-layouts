@@ -73,6 +73,26 @@ def hypr_monitors() -> list[dict]:
 # Identity
 # --------------------------------------------------------------------------
 
+def is_dummy_monitor(mon: dict) -> bool:
+    """True for amdgpu/vkms dummy EDIDs, not a real panel.
+
+    After s2idle those connectors often come back as connected 0x0 outputs
+    named "The Linux Foundation Linux FHD". Hyprland then modesets them,
+    they steal CRTCs from the laptop panel, and the connected-set no longer
+    matches laptop-only (or any saved desk).
+    """
+    make = str(mon.get("make") or "").strip()
+    model = str(mon.get("model") or "").strip()
+    desc = str(mon.get("description") or "").strip()
+    if make == "The Linux Foundation" and "Linux FHD" in model:
+        return True
+    return desc.startswith("The Linux Foundation Linux FHD")
+
+
+def real_monitors(mons: list[dict]) -> list[dict]:
+    return [m for m in mons if not is_dummy_monitor(m)]
+
+
 def fingerprint(mon: dict) -> str:
     """Stable identity for a live monitor. Deliberately excludes the connector
     name, which renumbers, and the serial, which some panels fake."""
@@ -476,6 +496,45 @@ def lua_string(value: str) -> str:
     return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
+def disable_dummy_outputs() -> list[str]:
+    """Disable dummy DRM sinks so they stop occupying CRTCs.
+
+    Returns the connector names Hyprland was asked to disable. Already-disabled
+    dummies are left alone. Failures are swallowed: a wedged modeset must not
+    block auto-apply of the real desk.
+    """
+    try:
+        raw = hyprctl(["-j", "monitors", "all"], capture=True)
+    except SystemExit:
+        try:
+            raw = hyprctl(["-j", "monitors"], capture=True)
+        except SystemExit:
+            return []
+    try:
+        mons = list(json.loads(raw))
+    except json.JSONDecodeError:
+        return []
+    names: list[str] = []
+    for mon in mons:
+        if not is_dummy_monitor(mon) or mon.get("disabled"):
+            continue
+        name = str(mon.get("name") or "")
+        if not OUTPUT_RE.fullmatch(name):
+            continue
+        try:
+            hyprctl(
+                [
+                    "eval",
+                    "hl.monitor({ output = %s, disabled = true })"
+                    % lua_string(name),
+                ]
+            )
+        except SystemExit:
+            continue
+        names.append(name)
+    return names
+
+
 def apply_monitor(name: str, mode: str, pos: str, scale: float) -> None:
     expr = (
         "hl.monitor({ output = %s, mode = %s, position = %s, scale = %.2f })"
@@ -492,7 +551,8 @@ def apply_profile(profile: dict) -> list[str]:
     claims what it can actually verify: that the compositor is now driving the
     geometry the profile asked for.
     """
-    mons = hypr_monitors()
+    disable_dummy_outputs()
+    mons = real_monitors(hypr_monitors())
     mapping = assign_outputs(profile, mons)
     if not mapping:
         raise SystemExit("could not match saved outputs to the connected screens")
@@ -561,7 +621,7 @@ def write_hyprmon(applied: list[dict]) -> None:
 # --------------------------------------------------------------------------
 
 def snapshot(name: str | None = None, pid: str | None = None) -> dict:
-    mons = hypr_monitors()
+    mons = real_monitors(hypr_monitors())
     if not mons:
         raise SystemExit("no monitors from hyprctl")
     if not pid:
@@ -618,7 +678,7 @@ def snapshot(name: str | None = None, pid: str | None = None) -> dict:
 # --------------------------------------------------------------------------
 
 def status_payload() -> dict:
-    mons = hypr_monitors()
+    mons = real_monitors(hypr_monitors())
     profiles = load_profiles()
     connected = sorted(fingerprint(m) for m in mons)
     match = detect(profiles, mons)
@@ -713,7 +773,7 @@ def cmd_save(args: argparse.Namespace) -> int:
         ]
     )
     STATE_DIR.mkdir(parents=True, exist_ok=True)
-    mons = hypr_monitors()
+    mons = real_monitors(hypr_monitors())
     ACTIVE_PATH.write_text(snap["id"] + "\n")
     LAST_SET_PATH.write_text(json.dumps(topology_key(mons)) + "\n")
     remember_choice(mons, snap["id"])
@@ -728,11 +788,10 @@ def cmd_apply(args: argparse.Namespace) -> int:
     profiles = {p["id"]: p for p in load_profiles()}
     if args.name not in profiles:
         raise SystemExit(f"unknown profile: {args.name}")
-    mons = hypr_monitors()
     problems = apply_profile(profiles[args.name])
     # An explicit apply is the user's decision; pin it so the next hotplug or
     # auto-apply pass does not overrule it.
-    remember_choice(mons, args.name)
+    remember_choice(real_monitors(hypr_monitors()), args.name)
     if args.json:
         print(json.dumps({"ok": not problems, "id": args.name, "problems": problems}))
     elif problems:
@@ -756,7 +815,9 @@ def cmd_list(args: argparse.Namespace) -> int:
 
 
 def cmd_detect(args: argparse.Namespace) -> int:
-    mons = hypr_monitors()
+    if args.apply:
+        disable_dummy_outputs()
+    mons = real_monitors(hypr_monitors())
     profiles = load_profiles()
     match = detect(profiles, mons)
     connected = sorted(fingerprint(m) for m in mons)

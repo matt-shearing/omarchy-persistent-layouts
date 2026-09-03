@@ -252,6 +252,51 @@ class AmbiguityTests(unittest.TestCase):
         self.assertEqual(a, b)
 
 
+class DummyEdidTests(unittest.TestCase):
+    """amdgpu dummy 'Linux FHD' EDIDs after s2idle must not poison matching."""
+
+    laptop = mon("eDP-2", "BOE", "NE160QDM-NZ6", 2560, 1600, 0, 0, 1.25, rr=165.0)
+    dummy = mon(
+        "DP-4",
+        "The Linux Foundation",
+        "Linux FHD",
+        0,
+        0,
+        32,
+        -1080,
+        1.0,
+        "Linux #0",
+    )
+    dummy2 = mon(
+        "DP-5",
+        "The Linux Foundation",
+        "Linux FHD",
+        0,
+        0,
+        -1920,
+        0,
+        1.0,
+        "Linux #0",
+    )
+    one = {
+        "id": "laptop-only",
+        "outputs": [spec("BOE", "NE160QDM-NZ6", "2560x1600@165.00", 1.25, "0x0")],
+    }
+
+    def test_linux_fhd_is_dummy(self):
+        self.assertTrue(cli.is_dummy_monitor(self.dummy))
+        self.assertFalse(cli.is_dummy_monitor(self.laptop))
+
+    def test_dummy_outputs_do_not_block_laptop_only(self):
+        mons = cli.real_monitors([self.laptop, self.dummy, self.dummy2])
+        self.assertEqual(cli.detect([self.one], mons)["id"], "laptop-only")
+
+    def test_a_real_second_display_still_blocks_laptop_only(self):
+        espresso = mon("DP-3", "ESP", "eD15(2024)", 1920, 1080, 32, -1120, 1.0, "0x00032867")
+        mons = cli.real_monitors([self.laptop, espresso, self.dummy])
+        self.assertIsNone(cli.detect([self.one], mons))
+
+
 class ModelJsTests(unittest.TestCase):
     def test_helpers_exist(self):
         text = (ROOT / "Model.js").read_text()
