@@ -68,7 +68,7 @@ That clones the plugin and can place the widget on the right side of the bar, ne
 
 Applying a layout is remembered for that set of screens, so an explicit click always beats auto-detection. If an output does not end up where the profile asked, the widget says the apply failed instead of claiming success.
 
-The matching service retries after a display is added or removed, and again after resume from sleep, because some HDMI sinks (Framework expansion cards after a long s2idle) take up to a minute to become ready. Every `hyprctl` call is bounded so a wedged modeset cannot stall auto-apply.
+The matching service retries after a display is added or removed, after a Hyprland config reload, and after resume from sleep, because some HDMI sinks (Framework expansion cards after a long s2idle) take up to two minutes to become ready, and `monitors.lua` disables dummy `Linux FHD` sinks on reload. If I2C still reads the portable behind that dummy, auto-apply drives the saved 1080p mode instead of leaving the panel dark. Every `hyprctl` call is bounded so a wedged modeset cannot stall auto-apply.
 
 ## Profiles and config
 

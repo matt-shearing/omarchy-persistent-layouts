@@ -28,11 +28,14 @@ Item {
     retry30.restart()
     retry60.restart()
     retry90.restart()
+    retry120.restart()
   }
 
   function onMonitorEvent(event) {
     var name = String(event && event.name ? event.name : "")
-    if (name.indexOf("monitoradded") === 0 || name.indexOf("monitorremoved") === 0)
+    // configreloaded: monitors.lua disables Linux FHD on every reload; re-apply
+    // so a dummy-masked Arzopa is driven at 1080p again instead of staying dark.
+    if (name.indexOf("monitoradded") === 0 || name.indexOf("monitorremoved") === 0 || name.indexOf("configreloaded") === 0)
       root.retryApply()
   }
 
@@ -53,6 +56,7 @@ Item {
   Timer { id: retry30; interval: 30000; repeat: false; onTriggered: root.applyDetected() }
   Timer { id: retry60; interval: 60000; repeat: false; onTriggered: root.applyDetected() }
   Timer { id: retry90; interval: 90000; repeat: false; onTriggered: root.applyDetected() }
+  Timer { id: retry120; interval: 120000; repeat: false; onTriggered: root.applyDetected() }
 
   Process {
     running: true
