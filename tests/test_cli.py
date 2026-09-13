@@ -67,6 +67,42 @@ class SanitizeTests(unittest.TestCase):
         with self.assertRaises(SystemExit):
             cli.check_scale("nope")
 
+    def test_underscan(self):
+        self.assertEqual(cli.check_underscan(None), None)
+        self.assertEqual(cli.check_underscan({}), None)
+        self.assertEqual(
+            cli.check_underscan({"hborder": 48, "vborder": 27}),
+            {"hborder": 48, "vborder": 27},
+        )
+        with self.assertRaises(SystemExit):
+            cli.check_underscan({"hborder": 999, "vborder": 0})
+        with self.assertRaises(SystemExit):
+            cli.check_underscan("on")
+
+    def test_parse_proptest_props(self):
+        text = (
+            "Connector 438 (eDP-2)\n"
+            "38 underscan:\n"
+            "value: 0\n"
+            "Connector 465 (DP-5)\n"
+            "38 underscan:\n"
+            "value: 0\n"
+            "39 underscan hborder:\n"
+            "value: 0\n"
+            "40 underscan vborder:\n"
+            "value: 0\n"
+        )
+        props = cli.parse_proptest_props(text, 465)
+        self.assertEqual(
+            props,
+            {
+                "underscan": 38,
+                "underscan hborder": 39,
+                "underscan vborder": 40,
+            },
+        )
+        self.assertEqual(cli.parse_proptest_props(text, 438), {"underscan": 38})
+
     def test_lua_string(self):
         self.assertEqual(cli.lua_string("DP-5"), '"DP-5"')
         self.assertEqual(cli.lua_string('a"b'), '"a\\"b"')
@@ -330,6 +366,28 @@ class DummyEdidTests(unittest.TestCase):
         self.assertTrue(cli.is_dummy_monitor(recovered))
         mons = cli.real_monitors([self.laptop, recovered])
         self.assertEqual(cli.detect([self.one], mons)["id"], "laptop-only")
+
+    def test_dummy_with_i2c_tht_tv_is_the_workbench_desk(self):
+        recovered = cli.recover_dummy_identity(
+            self.dummy2,
+            reader=lambda _name: {
+                "make": "THT",
+                "model": "LCD TV",
+                "serial": "",
+                "description": "THT LCD TV",
+            },
+        )
+        self.assertFalse(cli.is_dummy_monitor(recovered))
+        self.assertEqual(cli.fingerprint(recovered), "THT|LCD TV")
+        desk = {
+            "id": "workbench-tv",
+            "outputs": [
+                spec("BOE", "NE160QDM-NZ6", "2560x1600@165.00", 1.25, "0x0"),
+                spec("THT", "LCD TV", "1920x1080@60.00", 1.0, "64x-1080", "THT 40\" TV (behind)"),
+            ],
+        }
+        mons = cli.real_monitors([self.laptop, recovered])
+        self.assertEqual(cli.detect([self.one, desk], mons)["id"], "workbench-tv")
 
 
 class ModelJsTests(unittest.TestCase):

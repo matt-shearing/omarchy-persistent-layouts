@@ -110,6 +110,7 @@ PNP_MAKE = {
     "ESP": "ESP",
     "GSM": "LG Electronics",
     "BOE": "BOE",
+    "THT": "THT",
     "LNX": "The Linux Foundation",
 }
 
@@ -236,10 +237,11 @@ def recover_dummy_identity(mon: dict, reader=None) -> dict:
     make = str(parsed.get("make") or "")
     if make == "The Linux Foundation" or "Linux FHD" in model:
         return mon
-    known = model in {"ARZOPA", "LG TV SSCR2", "eD15(2024)"} or make in {
+    known = model in {"ARZOPA", "LG TV SSCR2", "eD15(2024)", "LCD TV"} or make in {
         "GWD",
         "ESP",
         "LG Electronics",
+        "THT",
     }
     if not known:
         return mon
@@ -651,6 +653,103 @@ def check_scale(scale: object) -> float:
     return value
 
 
+def check_underscan(value: object) -> dict | None:
+    """Optional AMD HDMI underscan for old TVs that crop the image.
+
+    Hyprland has no overscan control (issue #11462). amdgpu exposes
+    connector properties `underscan` / `underscan hborder` /
+    `underscan vborder` that shrink the scanout so a 2008-era TV's
+    overscan lands on black instead of the bar and window edges.
+    """
+    if value in (None, False, {}):
+        return None
+    if not isinstance(value, dict):
+        raise SystemExit(f"refusing unsafe underscan: {value!r}")
+    try:
+        h = int(value.get("hborder", 0))
+        v = int(value.get("vborder", 0))
+    except (TypeError, ValueError):
+        raise SystemExit(f"refusing unsafe underscan: {value!r}") from None
+    if not 0 <= h <= 128 or not 0 <= v <= 128:
+        raise SystemExit(f"refusing unsafe underscan: {value!r}")
+    return {"hborder": h, "vborder": v}
+
+
+PROPTEST_PROP_RE = re.compile(r"^(\d+) (underscan(?: hborder| vborder)?):\s*$")
+
+
+def parse_proptest_props(text: str, connector_id: int) -> dict[str, int]:
+    """Property-name → id for one connector from `proptest` output."""
+    prefix = f"Connector {int(connector_id)} "
+    block: list[str] = []
+    taking = False
+    for line in text.splitlines():
+        if line.startswith("Connector "):
+            if taking:
+                break
+            taking = line.startswith(prefix)
+            if taking:
+                block = [line]
+            continue
+        if taking:
+            block.append(line)
+    props: dict[str, int] = {}
+    for line in block:
+        m = PROPTEST_PROP_RE.match(line)
+        if m:
+            props[m.group(2)] = int(m.group(1))
+    return props
+
+
+def drm_connector_id(output: str) -> int | None:
+    if not OUTPUT_RE.fullmatch(output or ""):
+        return None
+    for path in sorted(Path("/sys/class/drm").glob(f"card*-{output}")):
+        cid = path / "connector_id"
+        try:
+            return int(cid.read_text().strip())
+        except (OSError, ValueError):
+            continue
+    return None
+
+
+def apply_underscan(output: str, underscan: dict | None) -> bool:
+    """Set amdgpu underscan on `output`. False if it could not be applied."""
+    us = check_underscan(underscan)
+    if not us:
+        return False
+    conn = drm_connector_id(output)
+    if conn is None:
+        return False
+    proptest = shutil.which("proptest")
+    if not proptest:
+        return False
+    try:
+        listing = subprocess.check_output(
+            HYPRCTL_TIMEOUT + [proptest], text=True, stderr=subprocess.DEVNULL
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return False
+    props = parse_proptest_props(listing, conn)
+    need = {
+        "underscan": 1,
+        "underscan hborder": us["hborder"],
+        "underscan vborder": us["vborder"],
+    }
+    if not all(name in props for name in need):
+        return False
+    try:
+        for name, value in need.items():
+            subprocess.check_call(
+                HYPRCTL_TIMEOUT + [proptest, str(conn), "connector", str(props[name]), str(int(value))],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return False
+    return True
+
+
 def lua_string(value: str) -> str:
     return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
@@ -751,7 +850,14 @@ def apply_profile(profile: dict) -> list[str]:
         scale = check_scale(spec.get("scale", 1))
         apply_monitor(name, mode, pos, scale, recovered=bool(mon.get("_recovered_from_dummy")))
         applied.append(
-            {"name": name, "mode": mode, "position": pos, "scale": scale, "spec": spec}
+            {
+                "name": name,
+                "mode": mode,
+                "position": pos,
+                "scale": scale,
+                "spec": spec,
+                "underscan": check_underscan(spec.get("underscan")),
+            }
         )
 
     # Clearing the Linux FHD desc rule can re-enable a true dummy on another
@@ -759,9 +865,19 @@ def apply_profile(profile: dict) -> list[str]:
     disable_dummy_outputs()
 
     time.sleep(SETTLE_SECONDS)
+    # Underscan is a DRM connector property, not a Hyprland monitor field.
+    # Apply it after the modeset so amdgpu does not reset the borders.
+    underscan_problems = []
+    for item in applied:
+        if item.get("underscan") and not apply_underscan(item["name"], item["underscan"]):
+            label = str(item["spec"].get("label") or "") or item["name"]
+            us = item["underscan"]
+            underscan_problems.append(
+                f"{label}: underscan hborder={us['hborder']} vborder={us['vborder']} did not take"
+            )
     after = {m["name"]: m for m in hypr_monitors()}
 
-    problems = []
+    problems = list(underscan_problems)
     for item in applied:
         mon = after.get(item["name"])
         label = str(item["spec"].get("label") or "") or item["name"]
@@ -819,8 +935,9 @@ def snapshot(name: str | None = None, pid: str | None = None) -> dict:
     if not name:
         name = pid.replace("-", " ").title()
 
-    # Carry forward any labels the user already curated for this profile.
+    # Carry forward any labels / underscan the user already curated.
     prior = {}
+    prior_underscan = {}
     prior_path = PROFILE_DIR / f"{pid}.json"
     try:
         old = json.loads(prior_path.read_text())
@@ -829,6 +946,10 @@ def snapshot(name: str | None = None, pid: str | None = None) -> dict:
             if o.get("label"):
                 prior[key] = o["label"]
             prior.setdefault((key[0], None), o.get("label"))
+            us = check_underscan(o.get("underscan"))
+            if us:
+                prior_underscan[key] = us
+                prior_underscan.setdefault((key[0], None), us)
     except (OSError, json.JSONDecodeError):
         pass
 
@@ -853,6 +974,9 @@ def snapshot(name: str | None = None, pid: str | None = None) -> dict:
             # This panel's advertised mode list cannot be trusted; the saved
             # mode is the only thing known to actually work on it.
             entry["trust_edid_modes"] = False
+        us = prior_underscan.get((fp, mode_dims(mon))) or prior_underscan.get((fp, None))
+        if us:
+            entry["underscan"] = us
         outputs.append(entry)
 
     return {

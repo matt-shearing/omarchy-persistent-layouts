@@ -82,6 +82,8 @@ An older `~/.config/omarchy/display-profiles/` directory is copied on first run.
 
 Applying a profile changes the live Hyprland layout. If `~/.config/hypr/hyprmon.lua` already exists, that file is refreshed so a HyprMon restart matches. `monitors.lua` is not edited.
 
+Old TVs that crop HDMI (overscan) can set per-output `underscan` in a profile — `{ "hborder": 48, "vborder": 27 }` is ~5% on 1080p. Hyprland has no overscan control; this sets the amdgpu connector properties after the modeset.
+
 ## Command line
 
 The bundled helper is invoked by the widget. From a checkout or an installed plugin folder:
