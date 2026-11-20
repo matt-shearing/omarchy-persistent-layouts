@@ -79,6 +79,25 @@ class SanitizeTests(unittest.TestCase):
         with self.assertRaises(SystemExit):
             cli.check_underscan("on")
 
+    def test_reserved(self):
+        self.assertEqual(cli.check_reserved(None), None)
+        self.assertEqual(cli.check_reserved({"top": 0}), None)
+        self.assertEqual(
+            cli.check_reserved({"top": 40, "left": 60}),
+            {"top": 40, "right": 0, "bottom": 0, "left": 60},
+        )
+        self.assertEqual(
+            cli.reserved_lua({"top": 40}),
+            ", reserved = { top = 40, right = 0, bottom = 0, left = 0 }",
+        )
+        self.assertEqual(cli.reserved_lua(None), "")
+        with self.assertRaises(SystemExit):
+            cli.check_reserved({"top": 9999})
+        with self.assertRaises(SystemExit):
+            cli.check_reserved({"top": "1; os.exit()"})
+        with self.assertRaises(SystemExit):
+            cli.check_reserved({"middle": 4})
+
     def test_parse_proptest_props(self):
         text = (
             "Connector 438 (eDP-2)\n"

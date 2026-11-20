@@ -675,6 +675,39 @@ def check_underscan(value: object) -> dict | None:
     return {"hborder": h, "vborder": v}
 
 
+RESERVED_SIDES = ("top", "right", "bottom", "left")
+
+
+def check_reserved(value: object) -> dict | None:
+    """Optional per-output inset for TVs that crop the picture (overscan).
+
+    Hyprland's monitor `reserved` area moves the bar and keeps windows off
+    the edges the TV hides. Unlike `underscan` it needs no DRM access, so it
+    works while Hyprland holds the connector. Values are logical pixels.
+    """
+    if value in (None, False, {}):
+        return None
+    if not isinstance(value, dict) or set(value) - set(RESERVED_SIDES):
+        raise SystemExit(f"refusing unsafe reserved: {value!r}")
+    out = {}
+    for side in RESERVED_SIDES:
+        try:
+            n = int(value.get(side, 0))
+        except (TypeError, ValueError):
+            raise SystemExit(f"refusing unsafe reserved: {value!r}") from None
+        if not 0 <= n <= 400:
+            raise SystemExit(f"refusing unsafe reserved: {value!r}")
+        out[side] = n
+    return out if any(out.values()) else None
+
+
+def reserved_lua(reserved: dict | None) -> str:
+    us = check_reserved(reserved)
+    if not us:
+        return ""
+    return ", reserved = { %s }" % ", ".join(f"{k} = {us[k]}" for k in RESERVED_SIDES)
+
+
 PROPTEST_PROP_RE = re.compile(r"^(\d+) (underscan(?: hborder| vborder)?):\s*$")
 
 
@@ -795,7 +828,12 @@ def disable_dummy_outputs() -> list[str]:
 
 
 def apply_monitor(
-    name: str, mode: str, pos: str, scale: float, recovered: bool = False
+    name: str,
+    mode: str,
+    pos: str,
+    scale: float,
+    recovered: bool = False,
+    reserved: dict | None = None,
 ) -> None:
     if recovered:
         # monitors.lua's last matching rule disables Linux FHD. A connector
@@ -806,9 +844,17 @@ def apply_monitor(
                 'hl.monitor({ output = "desc:The Linux Foundation Linux FHD", disabled = false })',
             ]
         )
+    # Always send `reserved` (zero when unset) so a previous profile's
+    # inset does not linger on a connector reused by another panel.
     expr = (
-        "hl.monitor({ output = %s, mode = %s, position = %s, scale = %.2f, disabled = false })"
-        % (lua_string(name), lua_string(mode), lua_string(pos), scale)
+        "hl.monitor({ output = %s, mode = %s, position = %s, scale = %.2f%s, disabled = false })"
+        % (
+            lua_string(name),
+            lua_string(mode),
+            lua_string(pos),
+            scale,
+            reserved_lua(reserved) or ", reserved = 0",
+        )
     )
     hyprctl(["eval", expr])
 
@@ -848,7 +894,15 @@ def apply_profile(profile: dict) -> list[str]:
             mode = "1920x1080@60"
         pos = check_position(str(spec.get("position") or "auto"))
         scale = check_scale(spec.get("scale", 1))
-        apply_monitor(name, mode, pos, scale, recovered=bool(mon.get("_recovered_from_dummy")))
+        reserved = check_reserved(spec.get("reserved"))
+        apply_monitor(
+            name,
+            mode,
+            pos,
+            scale,
+            recovered=bool(mon.get("_recovered_from_dummy")),
+            reserved=reserved,
+        )
         applied.append(
             {
                 "name": name,
@@ -857,6 +911,7 @@ def apply_profile(profile: dict) -> list[str]:
                 "scale": scale,
                 "spec": spec,
                 "underscan": check_underscan(spec.get("underscan")),
+                "reserved": reserved,
             }
         )
 
@@ -911,12 +966,13 @@ def write_hyprmon(applied: list[dict]) -> None:
             mode = mode + ".00"
         mode = check_mode(mode)
         lines.append(
-            "hl.monitor({ output = %s, mode = %s, position = %s, scale = %.2f })"
+            "hl.monitor({ output = %s, mode = %s, position = %s, scale = %.2f%s })"
             % (
                 lua_string(check_output_name(item["name"])),
                 lua_string(mode),
                 lua_string(check_position(item["position"])),
                 check_scale(item["scale"]),
+                reserved_lua(item.get("reserved")),
             )
         )
     HYPRMON.write_text("\n".join(lines) + "\n")
@@ -935,9 +991,11 @@ def snapshot(name: str | None = None, pid: str | None = None) -> dict:
     if not name:
         name = pid.replace("-", " ").title()
 
-    # Carry forward any labels / underscan the user already curated.
+    # Carry forward any labels / underscan / reserved the user already curated.
+    # Hyprland's live `reserved` includes the bar, so it is never snapshotted.
     prior = {}
     prior_underscan = {}
+    prior_reserved = {}
     prior_path = PROFILE_DIR / f"{pid}.json"
     try:
         old = json.loads(prior_path.read_text())
@@ -950,6 +1008,10 @@ def snapshot(name: str | None = None, pid: str | None = None) -> dict:
             if us:
                 prior_underscan[key] = us
                 prior_underscan.setdefault((key[0], None), us)
+            rs = check_reserved(o.get("reserved"))
+            if rs:
+                prior_reserved[key] = rs
+                prior_reserved.setdefault((key[0], None), rs)
     except (OSError, json.JSONDecodeError):
         pass
 
@@ -977,6 +1039,9 @@ def snapshot(name: str | None = None, pid: str | None = None) -> dict:
         us = prior_underscan.get((fp, mode_dims(mon))) or prior_underscan.get((fp, None))
         if us:
             entry["underscan"] = us
+        rs = prior_reserved.get((fp, mode_dims(mon))) or prior_reserved.get((fp, None))
+        if rs:
+            entry["reserved"] = rs
         outputs.append(entry)
 
     return {

@@ -84,6 +84,8 @@ Applying a profile changes the live Hyprland layout. If `~/.config/hypr/hyprmon.
 
 Old TVs that crop HDMI (overscan) can set per-output `underscan` in a profile — `{ "hborder": 48, "vborder": 27 }` is ~5% on 1080p. Hyprland has no overscan control; this sets the amdgpu connector properties after the modeset.
 
+If underscan does not take (the kernel refuses connector properties while Hyprland holds the display), set per-output `reserved` instead — `{ "top": 40, "right": 60, "bottom": 40, "left": 60 }` in logical pixels. It uses Hyprland's monitor reserved area, which moves the bar and keeps windows off the cropped edges. It is carried forward when the layout is re-saved.
+
 ## Command line
 
 The bundled helper is invoked by the widget. From a checkout or an installed plugin folder:
